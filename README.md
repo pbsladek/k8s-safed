@@ -300,4 +300,4 @@ bash scripts/submit-to-krew-index.sh
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
