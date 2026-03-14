@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# GoReleaser and the manifest-update step both need write access.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history is required for GoReleaser's changelog generation.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # -----------------------------------------------------------------------
+      # Build multi-arch binaries, create archives, publish the GitHub release.
+      # Artifacts land in ./dist/ for use by later steps.
+      # -----------------------------------------------------------------------
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # Rewrite plugin.yaml with real download URLs and SHA256 checksums from
+      # the GoReleaser-produced dist/checksums.txt, then attach the manifest
+      # to the release so users can install with:
+      #   kubectl krew install --manifest-url \
+      #     https://github.com/pbsladek/k8s-safed/releases/latest/download/plugin.yaml
+      # -----------------------------------------------------------------------
+      - name: Update krew plugin manifest
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: python3 scripts/update-krew-manifest.py
+
+      - name: Upload plugin.yaml to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: gh release upload "${VERSION}" plugin.yaml --clobber
+
+      # -----------------------------------------------------------------------
+      # Push the updated plugin.yaml to main so the raw GitHub URL always
+      # reflects the latest release:
+      #   kubectl krew install --manifest-url \
+      #     https://raw.githubusercontent.com/pbsladek/k8s-safed/main/plugin.yaml
+      # [skip ci] in the commit message prevents re-triggering the CI workflow.
+      # -----------------------------------------------------------------------
+      - name: Commit updated plugin.yaml to main
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: bash scripts/commit-manifest.sh
+
+  # ---------------------------------------------------------------------------
+  # Optional: open a PR against the official krew-index once the plugin is
+  # accepted there.
+  #
+  # Prerequisites (one-time manual setup — see README for full instructions):
+  #   1. Fork https://github.com/kubernetes-sigs/krew-index
+  #   2. Create a PAT with the "repo" scope and add it as the repository
+  #      secret KREW_INDEX_PR_TOKEN.
+  #   3. Add a repository variable KREW_INDEX_FORK set to your fork slug,
+  #      e.g. pbsladek/krew-index.
+  #   4. Uncomment this job.
+  # ---------------------------------------------------------------------------
+  # submit-to-krew-index:
+  #   name: Submit to krew-index
+  #   needs: release
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Open krew-index PR
+  #       env:
+  #         KREW_GITHUB_TOKEN: ${{ secrets.KREW_INDEX_PR_TOKEN }}
+  #         KREW_INDEX_FORK:   ${{ vars.KREW_INDEX_FORK }}
+  #         VERSION:           ${{ github.ref_name }}
+  #       run: bash scripts/submit-to-krew-index.sh

@@ -1,0 +1,60 @@
+apiVersion: krew.googlecontainertools.github.com/v1alpha2
+kind: Plugin
+metadata:
+  name: safed
+spec:
+  version: v0.1.0
+  homepage: https://github.com/pbsladek/k8s-safed
+  shortDescription: Safely drain nodes using rolling restarts
+  description: |
+    kubectl-safed drains Kubernetes nodes without causing downtime.
+
+    Instead of evicting pods directly, it:
+      1. Cordons the target node
+      2. Identifies Deployments and StatefulSets with pods on the node
+      3. Triggers rolling restarts to gracefully migrate pods to healthy nodes
+      4. Waits for all rollouts to complete
+      5. Evicts any remaining unmanaged pods
+
+    This approach avoids PodDisruptionBudget violations and service interruptions
+    that can occur with standard `kubectl drain`.
+  caveats: |
+    * The plugin requires permissions to cordon nodes, list/update Deployments,
+      StatefulSets, ReplicaSets, and evict Pods.
+    * DaemonSet pods are skipped by default (use --skip-daemon-sets=false to evict them).
+  platforms:
+  - selector:
+      matchLabels:
+        os: darwin
+        arch: amd64
+    uri: https://github.com/pbsladek/k8s-safed/releases/download/v0.1.0/kubectl-safed_darwin_amd64.tar.gz
+    sha256: "<sha256_placeholder>"
+    bin: kubectl-safed
+  - selector:
+      matchLabels:
+        os: darwin
+        arch: arm64
+    uri: https://github.com/pbsladek/k8s-safed/releases/download/v0.1.0/kubectl-safed_darwin_arm64.tar.gz
+    sha256: "<sha256_placeholder>"
+    bin: kubectl-safed
+  - selector:
+      matchLabels:
+        os: linux
+        arch: amd64
+    uri: https://github.com/pbsladek/k8s-safed/releases/download/v0.1.0/kubectl-safed_linux_amd64.tar.gz
+    sha256: "<sha256_placeholder>"
+    bin: kubectl-safed
+  - selector:
+      matchLabels:
+        os: linux
+        arch: arm64
+    uri: https://github.com/pbsladek/k8s-safed/releases/download/v0.1.0/kubectl-safed_linux_arm64.tar.gz
+    sha256: "<sha256_placeholder>"
+    bin: kubectl-safed
+  - selector:
+      matchLabels:
+        os: windows
+        arch: amd64
+    uri: https://github.com/pbsladek/k8s-safed/releases/download/v0.1.0/kubectl-safed_windows_amd64.zip
+    sha256: "<sha256_placeholder>"
+    bin: kubectl-safed.exe

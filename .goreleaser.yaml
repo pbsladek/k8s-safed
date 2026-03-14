@@ -1,0 +1,92 @@
+# .goreleaser.yaml
+# https://goreleaser.com/customization/
+version: 2
+
+project_name: kubectl-safed
+
+before:
+  hooks:
+    - go mod download
+    - go mod verify
+
+builds:
+  - id: kubectl-safed
+    main: .
+    binary: kubectl-safed
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    # Windows arm64 is not a common krew target; skip to keep the manifest tidy.
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      # Strip debug info for smaller binaries.
+      - -s -w
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: archives
+    builds:
+      - kubectl-safed
+    # Archive name without version so the krew manifest URLs are stable-ish.
+    # Full pattern: kubectl-safed_linux_amd64.tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+# Include the source code archive in the release.
+source:
+  enabled: true
+  name_template: "{{ .ProjectName }}_{{ .Tag }}_source"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
+  groups:
+    - title: New Features
+      regexp: "^feat"
+      order: 0
+    - title: Bug Fixes
+      regexp: "^fix"
+      order: 1
+    - title: Performance
+      regexp: "^perf"
+      order: 2
+    - title: Other Changes
+      order: 999
+
+release:
+  github:
+    owner: pbsladek
+    name: k8s-safed
+  name_template: "{{ .Tag }}"
+  draft: false
+  prerelease: auto
+  # Extra files to upload alongside the binaries.
+  # plugin.yaml is generated and uploaded by the release workflow after
+  # GoReleaser runs and checksums are available.
+  extra_files:
+    - glob: plugin.yaml
