@@ -33,7 +33,7 @@ builds:
 
 archives:
   - id: archives
-    builds:
+    ids:
       - kubectl-safed
     # Archive name without version so the krew manifest URLs are stable-ish.
     # Full pattern: kubectl-safed_linux_amd64.tar.gz

@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"time"
 
+	"golang.org/x/sync/errgroup"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
+	policyv1 "k8s.io/api/policy/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -17,6 +19,17 @@ import (
 	"github.com/pbsladek/k8s-safed/pkg/k8s"
 	"github.com/pbsladek/k8s-safed/pkg/workload"
 )
+
+// wSubject returns a "Kind/namespace/name" subject string for a workload.
+func wSubject(w workload.Workload) string {
+	return fmt.Sprintf("%s/%s/%s", w.Kind, w.Namespace, w.Name)
+}
+
+// depSubject returns a "Deployment/namespace/name" subject string.
+func depSubject(ns, name string) string { return "Deployment/" + ns + "/" + name }
+
+// stsSubject returns a "StatefulSet/namespace/name" subject string.
+func stsSubject(ns, name string) string { return "StatefulSet/" + ns + "/" + name }
 
 // deploymentProgressDeadlineExceeded is the Reason string set by the Deployment
 // controller when a rollout stalls beyond progressDeadlineSeconds.
@@ -34,7 +47,42 @@ type Options struct {
 	GracePeriod    int32
 	RolloutTimeout time.Duration
 	Force          bool
-	Out            *Printer
+	// ForceDeleteStandalone force-deletes pods with no owner references using
+	// a direct Delete (gracePeriodSeconds=0) instead of the Eviction API. Use
+	// this when you need these pods gone immediately and don't care about their
+	// shutdown hooks. Has no effect unless Force is also true.
+	ForceDeleteStandalone bool
+	Out                   *Printer
+	// PollInterval is the interval between condition checks in all wait loops.
+	// Defaults to 5s when zero; set to a small value in tests.
+	PollInterval time.Duration
+	// PodVacateTimeout is the per-workload deadline for verifying pods have left
+	// the node after a successful rollout. This is separate from RolloutTimeout
+	// because pod departure is bounded by terminationGracePeriodSeconds, not
+	// rollout convergence time. Defaults to 2 min when zero.
+	PodVacateTimeout time.Duration
+	// EvictionTimeout bounds how long evictWithPDBRetry will keep retrying a
+	// single pod that is blocked by a PodDisruptionBudget. Defaults to 5 min
+	// when zero. Set to a short value if you want a fast failure on PDB issues.
+	EvictionTimeout time.Duration
+	// PDBRetryInterval is the base interval between PDB-blocked eviction retries.
+	// Retries use exponential backoff starting at this value, capped at 60s.
+	// Defaults to 5s when zero.
+	PDBRetryInterval time.Duration
+	// MaxConcurrency controls how many workload rolling-restarts run in parallel.
+	//   1  – sequential, one workload at a time (default, safest)
+	//   N  – process workloads in batches of N; wait for each batch before starting the next
+	//   0  – all workloads concurrently (equivalent to N = len(workloads))
+	MaxConcurrency int
+	// UncordonOnFailure uncordons the node when the drain fails, restoring
+	// schedulability. Only applies if this drain session was the one that
+	// cordoned the node; nodes that were already cordoned before the drain
+	// started are left as-is.
+	UncordonOnFailure bool
+	// Preflight controls pre-drain health checks. PreflightModeWarn (default)
+	// logs findings and continues. PreflightModeStrict aborts on any risk-level
+	// issue. PreflightModeOff skips all checks.
+	Preflight PreflightMode
 }
 
 // Drainer orchestrates the safe drain sequence.
@@ -42,6 +90,40 @@ type Drainer struct {
 	opts   Options
 	client kubernetes.Interface
 	finder *workload.Finder
+}
+
+// pollInterval returns the configured poll interval, falling back to 5 s.
+func (d *Drainer) pollInterval() time.Duration {
+	if d.opts.PollInterval > 0 {
+		return d.opts.PollInterval
+	}
+	return 5 * time.Second
+}
+
+// podVacateTimeout returns the per-workload deadline for pod departure, falling
+// back to 2 min.
+func (d *Drainer) podVacateTimeout() time.Duration {
+	if d.opts.PodVacateTimeout > 0 {
+		return d.opts.PodVacateTimeout
+	}
+	return 2 * time.Minute
+}
+
+// evictionTimeout returns the per-pod PDB-retry deadline, falling back to 5 min.
+func (d *Drainer) evictionTimeout() time.Duration {
+	if d.opts.EvictionTimeout > 0 {
+		return d.opts.EvictionTimeout
+	}
+	return 5 * time.Minute
+}
+
+// pdbRetryInterval returns the base backoff interval for PDB-blocked evictions,
+// falling back to 5 s.
+func (d *Drainer) pdbRetryInterval() time.Duration {
+	if d.opts.PDBRetryInterval > 0 {
+		return d.opts.PDBRetryInterval
+	}
+	return 5 * time.Second
 }
 
 // NewDrainer creates a Drainer from the provided options.
@@ -56,102 +138,245 @@ func NewDrainer(opts Options) *Drainer {
 // Run executes the full safe-drain sequence:
 //
 //  1. Validate the node exists.
-//  2. Cordon the node (idempotent, patch-based — no resourceVersion conflicts).
-//  3. Discover all Deployments and StatefulSets with non-terminal pods on the node.
-//  4. For each workload: trigger a rolling restart, wait for the rollout to
-//     complete cluster-wide, then verify all pods have left this node.
-//  5. Evict any remaining pods (DaemonSets, standalones, Jobs) per flags.
-func (d *Drainer) Run(ctx context.Context) error {
+//  2. Discover all Deployments and StatefulSets with non-terminal pods on the node.
+//  3. Pre-flight checks: surface downtime risks and stateful-service warnings
+//     before making any cluster changes. Behaviour is controlled by Preflight:
+//     warn (default) logs and continues; strict aborts on any risk-level finding;
+//     off skips all checks.
+//  4. Cordon the node (idempotent, patch-based — no resourceVersion conflicts).
+//  5. Rolling-restart workloads according to MaxConcurrency:
+//     - 1 (default): strictly sequential, one workload fully done before the next.
+//     - N > 1:       batches of N run concurrently; each batch must complete before the next starts.
+//     - 0:           all workloads concurrently (use with caution on large nodes).
+//     Within a batch the first error cancels all siblings (fail-fast via errgroup).
+//  6. Evict any remaining pods (DaemonSets, standalones, Jobs) per flags.
+func (d *Drainer) Run(ctx context.Context) (retErr error) {
+	// Apply the overall drain deadline when set. All subordinate wait loops
+	// receive this bounded context so they cannot exceed the global budget.
+	if d.opts.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d.opts.Timeout)
+		defer cancel()
+	}
+
 	out := d.opts.Out
 	start := time.Now()
 
 	// Step 1: Validate node.
-	out.Infof("Validating node %q...", d.opts.NodeName)
+	out.Infof(d.opts.NodeName, "Validating %q", d.opts.NodeName)
 	node, err := d.client.CoreV1().Nodes().Get(ctx, d.opts.NodeName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("node %q not found: %w", d.opts.NodeName, err)
 	}
-	out.Infof("Node %q found (kernel: %s, ready: %v)",
-		d.opts.NodeName, node.Status.NodeInfo.KernelVersion, isNodeReady(node))
+	out.Infof(d.opts.NodeName, "Found · kernel=%s ready=%v",
+		node.Status.NodeInfo.KernelVersion, isNodeReady(node))
 
-	// Step 2: Cordon.
-	if err := d.cordon(ctx, node); err != nil {
-		return err
-	}
-
-	// Step 3: Discover workloads — single pass, selectors included.
-	out.Infof("Discovering managed workloads on %q...", d.opts.NodeName)
+	// Step 2: Discover workloads — before any cluster changes so pre-flight
+	// can see the full picture and the operator can abort without side effects.
+	out.Info(d.opts.NodeName, "Discovering managed workloads...")
 	workloads, err := d.finder.FindForNode(ctx, d.opts.NodeName)
 	if err != nil {
 		return fmt.Errorf("discovering workloads: %w", err)
 	}
 
 	if len(workloads) == 0 {
-		out.Infof("No managed workloads found on %q", d.opts.NodeName)
+		out.Info(d.opts.NodeName, "No managed workloads found")
 	} else {
-		out.Infof("Found %d managed workload(s) to rolling-restart:", len(workloads))
+		out.Infof(d.opts.NodeName, "Found %d managed workload(s) to restart:", len(workloads))
 		for _, w := range workloads {
-			out.Infof("  - %s", w)
+			out.Infof(d.opts.NodeName, "  · %s", w)
 		}
 	}
 
-	// Step 4: Rolling restart each workload one at a time.
-	// After each restart we wait for the rollout to complete globally and then
-	// confirm the node is clear of that workload's pods before moving on.
-	for i, w := range workloads {
-		if err := d.rollingRestart(ctx, i+1, len(workloads), w); err != nil {
+	// Step 3: Pre-flight checks — surface risks before making any cluster changes.
+	if d.opts.Preflight != PreflightModeOff {
+		if err := d.runPreflight(ctx, workloads); err != nil {
 			return err
 		}
 	}
 
-	// Step 5: Evict remaining pods.
+	// Step 4: Cordon.
+	cordonedByUs, err := d.cordon(ctx, node)
+	if err != nil {
+		return err
+	}
+	// If UncordonOnFailure is set and we were the ones who cordoned the node,
+	// schedule an uncordon on any failure path. We use a fresh context because
+	// the drain context may already be cancelled (e.g. on --timeout expiry).
+	if cordonedByUs && d.opts.UncordonOnFailure {
+		defer func() {
+			if retErr != nil {
+				d.uncordon(out)
+			}
+		}()
+	}
+
+	// Step 5: Rolling restart workloads (sequential, batch, or fully parallel).
+	if err := d.runWorkloads(ctx, workloads); err != nil {
+		return err
+	}
+
+	// Step 6: Evict remaining pods.
 	if err := d.evictRemaining(ctx); err != nil {
 		return err
 	}
 
-	out.Elapsed(start, "Node %q drained successfully", d.opts.NodeName)
+	if d.opts.DryRun {
+		out.DryRunf(d.opts.NodeName,"Dry-run complete — no changes were made to %q", d.opts.NodeName)
+	} else {
+		out.Elapsed(start, d.opts.NodeName,fmt.Sprintf("Drained %q", d.opts.NodeName))
+	}
+	return nil
+}
+
+// runWorkloads dispatches rolling restarts according to MaxConcurrency.
+//
+// Sequential (MaxConcurrency == 1): workloads run one at a time with step
+// counters in the log output.
+//
+// Batch (MaxConcurrency > 1): workloads are grouped into batches of that size.
+// All workloads in a batch start concurrently; the batch must fully complete
+// before the next one begins. The first error in a batch cancels all siblings
+// in that batch via errgroup context cancellation (fail-fast).
+//
+// Fully parallel (MaxConcurrency == 0): treated as a single batch containing
+// all workloads. Carries the same fail-fast guarantee.
+func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workload) error {
+	if len(workloads) == 0 {
+		return nil
+	}
+
+	maxC := d.opts.MaxConcurrency
+	out := d.opts.Out
+
+	// Sequential path: one workload at a time with step counters.
+	if maxC == 1 {
+		for i, w := range workloads {
+			t0 := time.Now()
+			out.Startf(wSubject(w), "Rolling restart [%d/%d]", i+1, len(workloads))
+			if err := d.rollingRestart(ctx, w); err != nil {
+				return err
+			}
+			if !d.opts.DryRun {
+				out.Elapsed(t0, wSubject(w), "Complete")
+			}
+		}
+		return nil
+	}
+
+	// Parallel / batch path.
+	if maxC <= 0 {
+		maxC = len(workloads) // 0 = unlimited
+	}
+	totalBatches := (len(workloads) + maxC - 1) / maxC
+
+	for batchStart := 0; batchStart < len(workloads); batchStart += maxC {
+		end := min(batchStart+maxC, len(workloads))
+		batch := workloads[batchStart:end]
+		batchNum := batchStart/maxC + 1
+
+		if totalBatches > 1 {
+			out.Infof(d.opts.NodeName,"batch %d/%d: starting %d workload(s) concurrently",
+				batchNum, totalBatches, len(batch))
+		} else {
+			out.Infof(d.opts.NodeName,"Starting all %d workload(s) concurrently", len(batch))
+		}
+		for _, w := range batch {
+			out.Infof(d.opts.NodeName,"  · %s", w)
+		}
+
+		g, gctx := errgroup.WithContext(ctx)
+		for _, w := range batch {
+			w := w // capture loop variable
+			g.Go(func() error {
+				t0 := time.Now()
+				out.Start(wSubject(w), "Rolling restart")
+				if err := d.rollingRestart(gctx, w); err != nil {
+					return err
+				}
+				if !d.opts.DryRun {
+					out.Elapsed(t0, wSubject(w), "Complete")
+				}
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return err
+		}
+
+		if totalBatches > 1 {
+			out.Infof(d.opts.NodeName,"batch %d/%d: all %d workload(s) complete",
+				batchNum, totalBatches, len(batch))
+		}
+	}
 	return nil
 }
 
 // cordon marks the node unschedulable via a strategic-merge patch so new pods
 // are not scheduled onto it. Using Patch (not Update) is idempotent and avoids
 // resourceVersion conflicts with concurrent controllers.
-func (d *Drainer) cordon(ctx context.Context, node *corev1.Node) error {
+//
+// Returns (true, nil) when this call performed the cordon, (false, nil) when
+// the node was already cordoned or when running in dry-run mode. The boolean
+// is used by Run to decide whether to schedule an uncordon on failure.
+func (d *Drainer) cordon(ctx context.Context, node *corev1.Node) (cordonedByUs bool, err error) {
+	out := d.opts.Out
 	if node.Spec.Unschedulable {
-		d.opts.Out.Infof("Node %q is already cordoned", d.opts.NodeName)
-		return nil
+		out.Info(d.opts.NodeName,"Already cordoned")
+		if d.opts.UncordonOnFailure {
+			out.Info(d.opts.NodeName,"NOTE: --uncordon-on-failure has no effect (node was already cordoned before this drain)")
+		}
+		return false, nil
 	}
 
 	if d.opts.DryRun {
-		d.opts.Out.DryRun("Would cordon node %q", d.opts.NodeName)
-		return nil
+		out.DryRunf(d.opts.NodeName,"Would cordon %q", d.opts.NodeName)
+		return false, nil
 	}
 
-	d.opts.Out.Infof("Cordoning node %q...", d.opts.NodeName)
+	out.Infof(d.opts.NodeName,"Cordoning %q...", d.opts.NodeName)
 	patch := []byte(`{"spec":{"unschedulable":true}}`)
+	_, err = d.client.CoreV1().Nodes().Patch(
+		ctx, d.opts.NodeName,
+		types.StrategicMergePatchType, patch,
+		metav1.PatchOptions{},
+	)
+	if err != nil {
+		return false, fmt.Errorf("cordoning node %q: %w", d.opts.NodeName, err)
+	}
+	out.Donef(d.opts.NodeName,"Cordoned %q", d.opts.NodeName)
+	return true, nil
+}
+
+// uncordon marks the node schedulable again. It uses a fresh context so it
+// still runs even when the drain context has already been cancelled (e.g. on
+// --timeout expiry). Best-effort: errors are logged but not propagated.
+func (d *Drainer) uncordon(out *Printer) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	patch := []byte(`{"spec":{"unschedulable":false}}`)
 	_, err := d.client.CoreV1().Nodes().Patch(
 		ctx, d.opts.NodeName,
 		types.StrategicMergePatchType, patch,
 		metav1.PatchOptions{},
 	)
 	if err != nil {
-		return fmt.Errorf("cordoning node %q: %w", d.opts.NodeName, err)
+		out.Infof(d.opts.NodeName,"WARNING: failed to uncordon %q after drain failure: %v", d.opts.NodeName, err)
+		return
 	}
-	d.opts.Out.Infof("Node %q cordoned", d.opts.NodeName)
-	return nil
+	out.Donef(d.opts.NodeName,"Uncordoned %q (drain failed, --uncordon-on-failure is set)", d.opts.NodeName)
 }
 
 // rollingRestart triggers a rolling restart for w, waits for the rollout to
 // complete cluster-wide, then verifies all of w's pods have left this node.
-func (d *Drainer) rollingRestart(ctx context.Context, step, total int, w workload.Workload) error {
-	out := d.opts.Out
-
+// Start/complete announcements and step counters are handled by the caller
+// (runWorkloads) so this method stays usable in both sequential and concurrent
+// contexts without duplicating log lines.
+func (d *Drainer) rollingRestart(ctx context.Context, w workload.Workload) error {
 	if d.opts.DryRun {
-		out.DryRun("[%d/%d] Would trigger rolling restart for %s", step, total, w)
+		d.opts.Out.DryRun(wSubject(w), "Would rolling-restart")
 		return nil
 	}
-
-	out.Step(step, total, "Rolling restart: %s", w)
 
 	switch w.Kind {
 	case workload.KindDeployment:
@@ -181,55 +406,43 @@ func (d *Drainer) rollingRestart(ctx context.Context, step, total int, w workloa
 		return fmt.Errorf("%s pods did not leave node %q: %w", w, d.opts.NodeName, err)
 	}
 
-	out.Step(step, total, "Complete: %s", w)
 	return nil
 }
 
 // restartDeployment patches the Deployment pod template with a restartedAt
 // annotation (identical to `kubectl rollout restart`). Returns the Deployment's
-// generation before the patch so the rollout wait can anchor on it.
+// generation from the PATCH response so the rollout wait can anchor on the
+// exact revision this drain triggered, not a stale pre-patch snapshot.
 func (d *Drainer) restartDeployment(ctx context.Context, namespace, name string) (int64, error) {
-	dep, err := d.client.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return 0, fmt.Errorf("getting Deployment %s/%s: %w", namespace, name, err)
-	}
-	preGen := dep.Generation
-
 	patch, err := buildRestartPatch()
 	if err != nil {
 		return 0, err
 	}
-	_, err = d.client.AppsV1().Deployments(namespace).Patch(
+	updated, err := d.client.AppsV1().Deployments(namespace).Patch(
 		ctx, name, types.StrategicMergePatchType, patch, metav1.PatchOptions{},
 	)
 	if err != nil {
 		return 0, fmt.Errorf("patching Deployment %s/%s: %w", namespace, name, err)
 	}
-	d.opts.Out.Infof("  Restart annotation applied to Deployment %s/%s (gen %d)", namespace, name, preGen)
-	return preGen, nil
+	d.opts.Out.Infof(depSubject(namespace, name), "Restart patch applied (targetGen=%d)", updated.Generation)
+	return updated.Generation, nil
 }
 
 // restartStatefulSet patches the StatefulSet pod template with a restartedAt
-// annotation. Returns the StatefulSet's generation before the patch.
+// annotation. Returns the StatefulSet's generation from the PATCH response.
 func (d *Drainer) restartStatefulSet(ctx context.Context, namespace, name string) (int64, error) {
-	sts, err := d.client.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return 0, fmt.Errorf("getting StatefulSet %s/%s: %w", namespace, name, err)
-	}
-	preGen := sts.Generation
-
 	patch, err := buildRestartPatch()
 	if err != nil {
 		return 0, err
 	}
-	_, err = d.client.AppsV1().StatefulSets(namespace).Patch(
+	updated, err := d.client.AppsV1().StatefulSets(namespace).Patch(
 		ctx, name, types.StrategicMergePatchType, patch, metav1.PatchOptions{},
 	)
 	if err != nil {
 		return 0, fmt.Errorf("patching StatefulSet %s/%s: %w", namespace, name, err)
 	}
-	d.opts.Out.Infof("  Restart annotation applied to StatefulSet %s/%s (gen %d)", namespace, name, preGen)
-	return preGen, nil
+	d.opts.Out.Infof(stsSubject(namespace, name), "Restart patch applied (targetGen=%d)", updated.Generation)
+	return updated.Generation, nil
 }
 
 // buildRestartPatch constructs the strategic-merge patch that sets the
@@ -256,17 +469,31 @@ func buildRestartPatch() ([]byte, error) {
 
 // waitForDeploymentRollout polls until the Deployment's rollout is complete.
 //
-// It gates on ObservedGeneration > preGeneration to avoid reading stale status
-// before the controller processes the new spec. It logs rolling progress on
-// every poll and fails fast if the Progressing condition indicates the
-// rollout deadline was exceeded.
-func (d *Drainer) waitForDeploymentRollout(ctx context.Context, namespace, name string, preGeneration int64) error {
-	d.opts.Out.Infof("  Waiting for Deployment %s/%s rollout (preGen=%d)...", namespace, name, preGeneration)
+// targetGeneration is the Generation from the PATCH response, so it reflects
+// exactly the revision this drain triggered. The gate `ObservedGeneration <
+// targetGeneration` ensures we don't read stale status from a prior reconcile
+// cycle and avoids false-completion if a concurrent change incremented
+// Generation before our patch was applied.
+//
+// Fail-fast paths:
+//   - ProgressDeadlineExceeded condition on the Deployment itself.
+//   - Any pod matching the workload selector stuck in CrashLoopBackOff,
+//     ImagePullBackOff, or ErrImagePull.
+func (d *Drainer) waitForDeploymentRollout(ctx context.Context, namespace, name string, targetGeneration int64) error {
+	subj := depSubject(namespace, name)
+	d.opts.Out.Pollf(subj, "Waiting for rollout (targetGen=%d)", targetGeneration)
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, d.opts.RolloutTimeout)
-	defer cancel()
-
-	return wait.PollUntilContextTimeout(timeoutCtx, 5*time.Second, d.opts.RolloutTimeout, false,
+	// Single timeout via PollUntilContextTimeout — no manual context wrapper.
+	// The caller's ctx already carries the global --timeout deadline; RolloutTimeout
+	// is the per-workload budget on top of that. Zero means no per-workload limit
+	// (only the global --timeout applies).
+	rolloutCtx := ctx
+	if d.opts.RolloutTimeout > 0 {
+		var cancel context.CancelFunc
+		rolloutCtx, cancel = context.WithTimeout(ctx, d.opts.RolloutTimeout)
+		defer cancel()
+	}
+	return wait.PollUntilContextCancel(rolloutCtx, d.pollInterval(), true,
 		func(ctx context.Context) (bool, error) {
 			dep, err := d.client.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
@@ -274,10 +501,10 @@ func (d *Drainer) waitForDeploymentRollout(ctx context.Context, namespace, name 
 			}
 			s := dep.Status
 
-			// Gate: wait for the controller to observe the new generation.
-			if s.ObservedGeneration <= preGeneration {
-				d.opts.Out.Infof("  [%s/%s] waiting for controller (observedGen=%d, need >%d)",
-					namespace, name, s.ObservedGeneration, preGeneration)
+			// Gate: wait for the controller to observe the generation we patched.
+			if s.ObservedGeneration < targetGeneration {
+				d.opts.Out.Pollf(subj, "waiting for controller (observedGen=%d need >=%d)",
+					s.ObservedGeneration, targetGeneration)
 				return false, nil
 			}
 
@@ -295,13 +522,26 @@ func (d *Drainer) waitForDeploymentRollout(ctx context.Context, namespace, name 
 				desired = *dep.Spec.Replicas
 			}
 
-			d.opts.Out.Infof("  [%s/%s] updated=%d/%d ready=%d/%d available=%d/%d unavailable=%d",
-				namespace, name,
+			d.opts.Out.Pollf(subj, "rollout updated=%d/%d ready=%d/%d available=%d/%d unavail=%d",
 				s.UpdatedReplicas, desired,
 				s.ReadyReplicas, desired,
 				s.AvailableReplicas, desired,
 				s.UnavailableReplicas,
 			)
+
+			// Fail fast on unrecoverable pod states — much faster than waiting
+			// for ProgressDeadlineExceeded (cluster default: 600 s).
+			// Use the new ReplicaSet's selector so we only check new-revision
+			// pods and avoid false-positives on old pods being replaced.
+			newSel, err := d.newReplicaSetSelector(ctx, dep)
+			if err != nil {
+				return false, fmt.Errorf("resolving new ReplicaSet selector: %w", err)
+			}
+			if reason, pod, err := d.findBadPodState(ctx, namespace, newSel); err != nil {
+				return false, fmt.Errorf("checking pod states: %w", err)
+			} else if reason != "" {
+				return false, fmt.Errorf("pod %s/%s stuck in %s — rollout will not complete", pod.Namespace, pod.Name, reason)
+			}
 
 			return s.UpdatedReplicas == desired &&
 				s.ReadyReplicas == desired &&
@@ -321,13 +561,38 @@ func (d *Drainer) waitForDeploymentRollout(ctx context.Context, namespace, name 
 //
 // Note: CurrentReplicas counts pods at the OLD revision during a rolling update
 // and must NOT be used as the completion indicator.
-func (d *Drainer) waitForStatefulSetRollout(ctx context.Context, namespace, name string, preGeneration int64) error {
-	d.opts.Out.Infof("  Waiting for StatefulSet %s/%s rollout (preGen=%d)...", namespace, name, preGeneration)
+// waitForStatefulSetRollout polls until the StatefulSet's rollout is complete.
+//
+// targetGeneration is the Generation from the PATCH response.
+//
+// The correct terminal condition requires all of:
+//   - ObservedGeneration >= targetGeneration   (controller processed our patch)
+//   - UpdateRevision == CurrentRevision        (all pods at the new revision)
+//   - UpdatedReplicas == desired               (controller updated all pods)
+//   - CurrentReplicas == desired               (controller set CurrentRevision on all)
+//   - ReadyReplicas == desired                 (all pods passing readiness probes)
+//
+// Note: CurrentReplicas counts pods at CurrentRevision (the OLD revision during
+// a rolling update). Once all pods are updated, CurrentRevision flips to equal
+// UpdateRevision and CurrentReplicas reaches desired. Checking both
+// UpdatedReplicas and CurrentReplicas prevents false completion during the
+// brief window when UpdateRevision == CurrentRevision but the controller hasn't
+// yet reconciled all status fields.
+//
+// StatefulSets have no ProgressDeadlineExceeded condition, so bad pod states
+// (CrashLoopBackOff, ImagePullBackOff, ErrImagePull) are the primary fail-fast
+// mechanism here.
+func (d *Drainer) waitForStatefulSetRollout(ctx context.Context, namespace, name string, targetGeneration int64) error {
+	subj := stsSubject(namespace, name)
+	d.opts.Out.Pollf(subj, "Waiting for rollout (targetGen=%d)", targetGeneration)
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, d.opts.RolloutTimeout)
-	defer cancel()
-
-	return wait.PollUntilContextTimeout(timeoutCtx, 5*time.Second, d.opts.RolloutTimeout, false,
+	rolloutCtx := ctx
+	if d.opts.RolloutTimeout > 0 {
+		var cancel context.CancelFunc
+		rolloutCtx, cancel = context.WithTimeout(ctx, d.opts.RolloutTimeout)
+		defer cancel()
+	}
+	return wait.PollUntilContextCancel(rolloutCtx, d.pollInterval(), true,
 		func(ctx context.Context) (bool, error) {
 			sts, err := d.client.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
@@ -335,10 +600,9 @@ func (d *Drainer) waitForStatefulSetRollout(ctx context.Context, namespace, name
 			}
 			s := sts.Status
 
-			// ObservedGeneration is int64 (not *int64) in k8s.io/api v0.31.0.
-			if s.ObservedGeneration <= preGeneration {
-				d.opts.Out.Infof("  [%s/%s] waiting for controller (observedGen=%d, need >%d)",
-					namespace, name, s.ObservedGeneration, preGeneration)
+			if s.ObservedGeneration < targetGeneration {
+				d.opts.Out.Pollf(subj, "waiting for controller (observedGen=%d need >=%d)",
+					s.ObservedGeneration, targetGeneration)
 				return false, nil
 			}
 
@@ -347,18 +611,32 @@ func (d *Drainer) waitForStatefulSetRollout(ctx context.Context, namespace, name
 				desired = *sts.Spec.Replicas
 			}
 
-			d.opts.Out.Infof("  [%s/%s] updated=%d/%d ready=%d/%d (updateRev=%s currentRev=%s)",
-				namespace, name,
+			d.opts.Out.Pollf(subj, "rollout updated=%d/%d current=%d/%d ready=%d/%d (updateRev=%s currentRev=%s)",
 				s.UpdatedReplicas, desired,
+				s.CurrentReplicas, desired,
 				s.ReadyReplicas, desired,
 				s.UpdateRevision, s.CurrentRevision,
 			)
+
+			// Actively check pod states — StatefulSets have no
+			// ProgressDeadlineExceeded equivalent.
+			// Restrict to new-revision pods (controller-revision-hash =
+			// UpdateRevision) so we don't false-positive on old pods that
+			// are still being replaced. Fall back to the broad selector
+			// if UpdateRevision is not yet set.
+			revSel := newRevisionSelector(sts.Spec.Selector, s.UpdateRevision)
+			if reason, pod, err := d.findBadPodState(ctx, namespace, revSel); err != nil {
+				return false, fmt.Errorf("checking pod states: %w", err)
+			} else if reason != "" {
+				return false, fmt.Errorf("pod %s/%s stuck in %s — rollout will not complete", pod.Namespace, pod.Name, reason)
+			}
 
 			// Guard against two empty strings matching before the controller
 			// has set UpdateRevision.
 			return s.UpdateRevision != "" &&
 				s.UpdateRevision == s.CurrentRevision &&
 				s.UpdatedReplicas == desired &&
+				s.CurrentReplicas == desired &&
 				s.ReadyReplicas == desired, nil
 		},
 	)
@@ -371,17 +649,16 @@ func (d *Drainer) waitForStatefulSetRollout(ctx context.Context, namespace, name
 // the workload is already healthy on other nodes — the termination cleanup is
 // kubelet's responsibility and does not block the drain.
 func (d *Drainer) waitForPodsOffNode(ctx context.Context, w workload.Workload) error {
-	d.opts.Out.Infof("  Verifying %s pods have left node %q...", w, d.opts.NodeName)
+	subj := wSubject(w)
+	vacate := d.podVacateTimeout()
+	d.opts.Out.Pollf(subj, "Verifying pods have left node %q (timeout=%s)", d.opts.NodeName, vacate)
 
 	selectorStr, err := buildLabelSelectorString(w.Selector)
 	if err != nil {
 		return fmt.Errorf("building pod selector for %s: %w", w, err)
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, d.opts.RolloutTimeout)
-	defer cancel()
-
-	return wait.PollUntilContextTimeout(timeoutCtx, 5*time.Second, d.opts.RolloutTimeout, true,
+	return wait.PollUntilContextTimeout(ctx, d.pollInterval(), vacate, true,
 		func(ctx context.Context) (bool, error) {
 			pods, err := d.client.CoreV1().Pods(w.Namespace).List(ctx, metav1.ListOptions{
 				LabelSelector: selectorStr,
@@ -406,13 +683,143 @@ func (d *Drainer) waitForPodsOffNode(ctx context.Context, w workload.Workload) e
 			}
 
 			if active > 0 {
-				d.opts.Out.Infof("  [%s] %d active pod(s) still on %q, waiting...",
-					w, active, d.opts.NodeName)
+				d.opts.Out.Pollf(subj, "%d active pod(s) still on %q, waiting", active, d.opts.NodeName)
 				return false, nil
 			}
 			return true, nil
 		},
 	)
+}
+
+// newReplicaSetSelector returns the label selector for the current (new)
+// ReplicaSet of dep. Using the new RS's selector instead of the Deployment's
+// broad selector prevents findBadPodState from flagging old-revision pods that
+// are still being replaced during a rolling update.
+//
+// The current RS is identified by matching the deployment.kubernetes.io/revision
+// annotation on both the Deployment and its owned ReplicaSets. Falls back to
+// dep.Spec.Selector if the new RS cannot be resolved (e.g. not yet created).
+func (d *Drainer) newReplicaSetSelector(ctx context.Context, dep *appsv1.Deployment) (*metav1.LabelSelector, error) {
+	depRevision := dep.Annotations["deployment.kubernetes.io/revision"]
+	if depRevision == "" {
+		return dep.Spec.Selector, nil
+	}
+
+	// Use the deployment's selector as a label filter to avoid fetching every
+	// RS in the namespace (important in namespaces with many deployments).
+	selStr, err := buildLabelSelectorString(dep.Spec.Selector)
+	if err != nil {
+		return dep.Spec.Selector, nil // fall back gracefully
+	}
+	rsList, err := d.client.AppsV1().ReplicaSets(dep.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selStr,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing ReplicaSets: %w", err)
+	}
+
+	for i := range rsList.Items {
+		rs := &rsList.Items[i]
+		if !isOwnedByUID(rs.OwnerReferences, dep.UID) {
+			continue
+		}
+		if rs.Annotations["deployment.kubernetes.io/revision"] == depRevision {
+			return rs.Spec.Selector, nil
+		}
+	}
+
+	// New RS not yet visible — fall back to the broad deployment selector.
+	return dep.Spec.Selector, nil
+}
+
+// isOwnedByUID reports whether any owner reference in refs matches uid.
+func isOwnedByUID(refs []metav1.OwnerReference, uid types.UID) bool {
+	for _, ref := range refs {
+		if ref.UID == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// newRevisionSelector builds a copy of base that additionally requires
+// controller-revision-hash == revisionHash. Used during StatefulSet rollout
+// monitoring to restrict bad-pod checks to new-revision pods only.
+// Returns base unmodified when revisionHash is empty (revision not yet assigned).
+func newRevisionSelector(base *metav1.LabelSelector, revisionHash string) *metav1.LabelSelector {
+	if base == nil || revisionHash == "" {
+		return base
+	}
+	labels := make(map[string]string, len(base.MatchLabels)+1)
+	for k, v := range base.MatchLabels {
+		labels[k] = v
+	}
+	labels["controller-revision-hash"] = revisionHash
+	return &metav1.LabelSelector{
+		MatchLabels:      labels,
+		MatchExpressions: base.MatchExpressions,
+	}
+}
+
+// findBadPodState lists pods matching sel in namespace and returns the first
+// container waiting reason that indicates the rollout will never recover:
+// CrashLoopBackOff, ImagePullBackOff, or ErrImagePull.
+//
+// API errors are returned so callers can distinguish "unknown state" from "no
+// bad state". A persistent API error (e.g. RBAC misconfiguration) should abort
+// the rollout rather than silently wait for the full timeout.
+func (d *Drainer) findBadPodState(ctx context.Context, namespace string, sel *metav1.LabelSelector) (reason string, badPod *corev1.Pod, err error) {
+	if sel == nil {
+		return "", nil, nil
+	}
+	selectorStr, err := buildLabelSelectorString(sel)
+	if err != nil {
+		return "", nil, fmt.Errorf("building selector: %w", err)
+	}
+	pods, err := d.client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selectorStr})
+	if err != nil {
+		return "", nil, fmt.Errorf("listing pods: %w", err)
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		for _, cs := range pod.Status.InitContainerStatuses {
+			if r := badWaitingReason(cs); r != "" {
+				return r, pod, nil
+			}
+		}
+		for _, cs := range pod.Status.ContainerStatuses {
+			if r := badWaitingReason(cs); r != "" {
+				return r, pod, nil
+			}
+		}
+	}
+	return "", nil, nil
+}
+
+// badWaitingReason returns the container's Waiting.Reason if it indicates an
+// unrecoverable state, or "".
+//
+// CrashLoopBackOff: gated on LastTerminationState.Terminated being non-nil,
+// which the kubelet sets after the container's first exit. This avoids
+// false-positives on slow-starting containers (e.g. heavy init containers)
+// that are in Waiting briefly before their first run.
+//
+// ImagePullBackOff / ErrImagePull: reported immediately — a bad image reference
+// will not self-heal without a spec change.
+func badWaitingReason(cs corev1.ContainerStatus) string {
+	if cs.State.Waiting == nil {
+		return ""
+	}
+	switch cs.State.Waiting.Reason {
+	case "CrashLoopBackOff":
+		// LastTerminationState is set after the container has exited at least once.
+		if cs.LastTerminationState.Terminated != nil {
+			return "CrashLoopBackOff"
+		}
+	case "ImagePullBackOff", "ErrImagePull":
+		return cs.State.Waiting.Reason
+	}
+	return ""
 }
 
 // buildLabelSelectorString converts a *metav1.LabelSelector to the string form
@@ -443,29 +850,94 @@ func (d *Drainer) evictRemaining(ctx context.Context) error {
 
 	evictable := filterEvictable(pods.Items, d.opts.SkipDaemonSets, d.opts.Force, d.opts.DeleteEmptyDir)
 	if len(evictable) == 0 {
-		out.Infof("No remaining pods to evict on %q", d.opts.NodeName)
+		out.Infof(d.opts.NodeName,"No remaining pods to evict on %q", d.opts.NodeName)
 		return nil
 	}
 
-	out.Infof("Evicting %d remaining pod(s) on %q:", len(evictable), d.opts.NodeName)
+	out.Infof(d.opts.NodeName,"Evicting %d remaining pod(s) on %q:", len(evictable), d.opts.NodeName)
 	for i := range evictable {
 		pod := &evictable[i]
-		out.Infof("  - %s/%s [owner: %s]", pod.Namespace, pod.Name, podOwnerKind(pod))
+		out.Infof(d.opts.NodeName,"  · %s/%s [owner: %s]", pod.Namespace, pod.Name, podOwnerKind(pod))
 	}
 
 	for i := range evictable {
 		pod := &evictable[i]
+		podSubj := fmt.Sprintf("Pod/%s/%s", pod.Namespace, pod.Name)
 		if d.opts.DryRun {
-			out.DryRun("Would evict pod %s/%s", pod.Namespace, pod.Name)
+			if d.opts.ForceDeleteStandalone && len(pod.OwnerReferences) == 0 {
+				out.DryRunf(podSubj, "Would force-delete (standalone, no owner)")
+			} else {
+				out.DryRunf(podSubj, "Would evict (owner: %s)", podOwnerKind(pod))
+			}
 			continue
 		}
-		if err := d.client.CoreV1().Pods(pod.Namespace).Evict(ctx, buildEviction(pod, d.opts.GracePeriod)); err != nil {
-			return fmt.Errorf("evicting pod %s/%s: %w", pod.Namespace, pod.Name, err)
+
+		// Standalone pods with ForceDeleteStandalone: bypass the eviction API
+		// (which respects PDB) and issue a direct delete with gracePeriodSeconds=0.
+		if d.opts.ForceDeleteStandalone && len(pod.OwnerReferences) == 0 {
+			gp := int64(0)
+			if err := d.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{
+				GracePeriodSeconds: &gp,
+			}); err != nil && !k8serrors.IsNotFound(err) {
+				return fmt.Errorf("force-deleting pod %s/%s: %w", pod.Namespace, pod.Name, err)
+			}
+			out.Done(podSubj, "Force-deleted (standalone)")
+			continue
 		}
-		out.Infof("  Evicted %s/%s", pod.Namespace, pod.Name)
+
+		if err := d.evictWithPDBRetry(ctx, out, podSubj, pod); err != nil {
+			return err
+		}
 	}
 
 	return nil
+}
+
+// evictWithPDBRetry calls EvictV1 and retries when the eviction is temporarily
+// blocked by a PodDisruptionBudget (HTTP 429) or quota (HTTP 503).
+//
+// Retries use exponential backoff (base = PDBRetryInterval, cap = 60 s) and
+// are bounded by EvictionTimeout. This prevents the drain from hanging
+// indefinitely on a misconfigured PDB.
+func (d *Drainer) evictWithPDBRetry(ctx context.Context, out *Printer, subj string, pod *corev1.Pod) error {
+	evictCtx, cancel := context.WithTimeout(ctx, d.evictionTimeout())
+	defer cancel()
+
+	interval := d.pdbRetryInterval()
+	const maxInterval = 60 * time.Second
+
+	for attempt := 1; ; attempt++ {
+		err := d.client.CoreV1().Pods(pod.Namespace).EvictV1(evictCtx, buildEviction(pod, d.opts.GracePeriod))
+		if err == nil {
+			out.Done(subj, "Evicted")
+			return nil
+		}
+
+		// PDB temporarily blocks the eviction — back off and retry.
+		if k8serrors.IsTooManyRequests(err) || k8serrors.IsServiceUnavailable(err) {
+			out.Pollf(subj, "eviction blocked by PodDisruptionBudget (attempt %d), retrying in %s", attempt, interval)
+			select {
+			case <-evictCtx.Done():
+				return fmt.Errorf("evicting pod %s/%s: timed out waiting for PDB after %d attempt(s): %w",
+					pod.Namespace, pod.Name, attempt, evictCtx.Err())
+			case <-time.After(interval):
+				// Exponential backoff capped at maxInterval.
+				interval *= 2
+				if interval > maxInterval {
+					interval = maxInterval
+				}
+				continue
+			}
+		}
+
+		// Pod already gone — treat as success.
+		if k8serrors.IsNotFound(err) {
+			out.Done(subj, "Already gone")
+			return nil
+		}
+
+		return fmt.Errorf("evicting pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
 }
 
 // filterEvictable returns the subset of pods eligible for conventional eviction.
@@ -563,8 +1035,8 @@ func isNodeReady(node *corev1.Node) bool {
 	return false
 }
 
-func buildEviction(pod *corev1.Pod, gracePeriod int32) *policyv1beta1.Eviction {
-	eviction := &policyv1beta1.Eviction{
+func buildEviction(pod *corev1.Pod, gracePeriod int32) *policyv1.Eviction {
+	eviction := &policyv1.Eviction{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pod.Name,
 			Namespace: pod.Namespace,

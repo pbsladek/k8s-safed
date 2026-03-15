@@ -1,0 +1,65 @@
+BINARY     := kubectl-safed
+MODULE     := github.com/pbsladek/k8s-safed
+GOFLAGS    := -trimpath
+LDFLAGS    := -s -w
+
+# Respect GOBIN / PATH install location; default to /usr/local/bin.
+INSTALL_DIR ?= /usr/local/bin
+
+.PHONY: all build test vet lint fmt check install clean snapshot help
+
+all: check build ## Run checks then build (default)
+
+## ── Build ────────────────────────────────────────────────────────────────────
+
+build: ## Build the binary for the current platform
+	go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BINARY) .
+
+install: build ## Build and install to INSTALL_DIR (default /usr/local/bin)
+	install -m 0755 $(BINARY) $(INSTALL_DIR)/$(BINARY)
+
+## ── Quality ──────────────────────────────────────────────────────────────────
+
+test: ## Run all tests with race detector
+	go test -race ./...
+
+test-v: ## Run all tests verbose
+	go test -race -v ./...
+
+vet: ## Run go vet
+	go vet ./...
+
+fmt: ## Format all Go source files
+	go fmt ./...
+
+lint: ## Run golangci-lint (requires golangci-lint to be installed)
+	golangci-lint run ./...
+
+check: fmt vet test ## Format, vet, and test
+
+## ── Dependencies ─────────────────────────────────────────────────────────────
+
+deps: ## Download and verify modules
+	go mod download
+	go mod verify
+
+tidy: ## Tidy go.mod and go.sum
+	go mod tidy
+
+## ── Release ──────────────────────────────────────────────────────────────────
+
+snapshot: ## Build a local multi-arch snapshot via GoReleaser (no publish)
+	goreleaser release --snapshot --clean
+
+releaser-check: ## Validate the .goreleaser.yaml config
+	goreleaser check
+
+## ── Housekeeping ─────────────────────────────────────────────────────────────
+
+clean: ## Remove build artefacts
+	rm -f $(BINARY)
+	rm -rf dist/
+
+help: ## Show this help
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
+		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
