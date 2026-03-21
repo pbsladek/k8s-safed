@@ -3,6 +3,7 @@ package workload
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -18,6 +19,14 @@ const (
 	KindStatefulSet Kind = "StatefulSet"
 )
 
+// DrainPriorityAnnotation is the annotation key used to control drain order.
+// Lower values are drained first. Workloads without this annotation use
+// DefaultDrainPriority (100).
+const DrainPriorityAnnotation = "kubectl.safed.io/drain-priority"
+
+// DefaultDrainPriority is the priority assigned to unannotated workloads.
+const DefaultDrainPriority = 100
+
 // Workload holds a reference to a managed workload that owns pods on a node.
 // Selector is populated by FindForNode so callers can verify pods have left
 // the node without a second API call.
@@ -26,6 +35,25 @@ type Workload struct {
 	Namespace string
 	Name      string
 	Selector  *metav1.LabelSelector
+	// Priority controls drain order. Lower values are restarted first.
+	// Populated from the kubectl.safed.io/drain-priority annotation;
+	// defaults to DefaultDrainPriority (100) when the annotation is absent.
+	Priority int
+}
+
+// parseDrainPriority reads the drain-priority annotation and returns its
+// integer value, or DefaultDrainPriority if the annotation is absent or
+// cannot be parsed.
+func parseDrainPriority(annotations map[string]string) int {
+	v, ok := annotations[DrainPriorityAnnotation]
+	if !ok {
+		return DefaultDrainPriority
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return DefaultDrainPriority
+	}
+	return n
 }
 
 func (w Workload) String() string {
@@ -172,6 +200,7 @@ func (f *Finder) resolveDeployment(ctx context.Context, namespace, name string) 
 		Namespace: namespace,
 		Name:      name,
 		Selector:  dep.Spec.Selector,
+		Priority:  parseDrainPriority(dep.Annotations),
 	}
 	f.wlCache[wlKey] = w
 	return w, true, nil
@@ -195,6 +224,7 @@ func (f *Finder) resolveStatefulSet(ctx context.Context, namespace, name string)
 		Namespace: namespace,
 		Name:      name,
 		Selector:  sts.Spec.Selector,
+		Priority:  parseDrainPriority(sts.Annotations),
 	}
 	f.wlCache[wlKey] = w
 	return w, true, nil

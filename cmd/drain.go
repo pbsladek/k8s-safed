@@ -9,6 +9,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/pbsladek/k8s-safed/pkg/config"
 	"github.com/pbsladek/k8s-safed/pkg/drain"
 	"github.com/pbsladek/k8s-safed/pkg/k8s"
 	"github.com/spf13/cobra"
@@ -35,6 +36,17 @@ type drainOptions struct {
 	nodeConcurrency int
 	// Pre-flight options.
 	preflight string
+	// Workload filtering.
+	skipWorkloads []string
+	onlyWorkloads []string
+	// Profile support.
+	profile    string
+	configFile string
+	// Event emission.
+	emitEvents bool
+	// Checkpoint / resume.
+	resume         bool
+	checkpointPath string
 }
 
 func newDrainCmd() *cobra.Command {
@@ -81,7 +93,10 @@ Examples:
 			if len(args) > 0 && opts.nodeSelector != "" {
 				return fmt.Errorf("cannot specify both node names and --selector")
 			}
-			return runDrain(cmd.Context(), args, opts)
+			if len(opts.skipWorkloads) > 0 && len(opts.onlyWorkloads) > 0 {
+				return fmt.Errorf("cannot use both --skip-workload and --only-workload")
+			}
+			return runDrain(cmd, args, opts)
 		},
 	}
 
@@ -113,11 +128,26 @@ Examples:
 		"Number of nodes to drain in parallel (1 = sequential, default). Use with care on production clusters.")
 	cmd.Flags().StringVar(&opts.preflight, "preflight", "warn",
 		`Pre-flight check mode: "warn" (log risks, continue), "strict" (abort on any risk), "off" (skip all checks)`)
+	cmd.Flags().StringArrayVar(&opts.skipWorkloads, "skip-workload", nil,
+		`Exclude a workload from rolling restarts (format: Kind/namespace/name, e.g. Deployment/default/api). Repeatable. Mutually exclusive with --only-workload.`)
+	cmd.Flags().StringArrayVar(&opts.onlyWorkloads, "only-workload", nil,
+		`Restrict rolling restarts to these workloads only (format: Kind/namespace/name). Repeatable. Mutually exclusive with --skip-workload.`)
+	cmd.Flags().StringVar(&opts.profile, "profile", "",
+		`Load flag defaults from a named profile in the safed config file (see --config). CLI flags override profile values.`)
+	cmd.Flags().StringVar(&opts.configFile, "config", "",
+		`Path to the safed config file (default: ~/.kube/safed.yaml; env: KUBECTL_SAFED_CONFIG)`)
+	cmd.Flags().BoolVar(&opts.emitEvents, "emit-events", false,
+		"Emit Kubernetes Events to node and workload objects during drain (requires events/create RBAC permission)")
+	cmd.Flags().BoolVar(&opts.resume, "resume", false,
+		"Resume a previously interrupted drain, skipping workloads already recorded as complete in the checkpoint file")
+	cmd.Flags().StringVar(&opts.checkpointPath, "checkpoint-path", "",
+		"Override the checkpoint file path (default: ~/.kube/safed-checkpoints/<context>-<node>.json)")
 
 	return cmd
 }
 
-func runDrain(ctx context.Context, nodeArgs []string, opts *drainOptions) error {
+func runDrain(cmd *cobra.Command, nodeArgs []string, opts *drainOptions) error {
+	ctx := cmd.Context()
 	client, err := k8s.NewClient(kubeConfigFlags)
 	if err != nil {
 		return fmt.Errorf("failed to create Kubernetes client: %w", err)
@@ -128,12 +158,33 @@ func runDrain(ctx context.Context, nodeArgs []string, opts *drainOptions) error 
 		return err
 	}
 
+	// Apply profile defaults for any flags that were not explicitly set by the user.
+	if opts.profile != "" {
+		if err := applyProfile(cmd, opts); err != nil {
+			return err
+		}
+	}
+
 	// --force-delete-standalone implies --force (standalone pods require force).
 	force := opts.force || opts.forceDeleteStandalone
 
 	out := drain.NewPrinterWithFormat(os.Stdout, drain.LogFormat(opts.logFormat))
 
 	drainNode := func(ctx context.Context, nodeName string) error {
+		// Resolve per-node checkpoint path when --resume is set.
+		cpPath := opts.checkpointPath
+		if opts.resume && cpPath == "" {
+			kubeCtx := ""
+			if kubeConfigFlags.Context != nil {
+				kubeCtx = *kubeConfigFlags.Context
+			}
+			var err error
+			cpPath, err = drain.CheckpointPath(kubeCtx, nodeName)
+			if err != nil {
+				return fmt.Errorf("resolving checkpoint path: %w", err)
+			}
+		}
+
 		drainer := drain.NewDrainer(drain.Options{
 			Client:                client,
 			NodeName:              nodeName,
@@ -153,6 +204,11 @@ func runDrain(ctx context.Context, nodeArgs []string, opts *drainOptions) error 
 			Out:                   out,
 			UncordonOnFailure:     opts.uncordonOnFailure,
 			Preflight:             drain.PreflightMode(opts.preflight),
+			SkipWorkloads:         sliceToSet(opts.skipWorkloads),
+			OnlyWorkloads:         sliceToSet(opts.onlyWorkloads),
+			EmitEvents:            opts.emitEvents,
+			Resume:                opts.resume,
+			CheckpointPath:        cpPath,
 		})
 		return drainer.Run(ctx)
 	}
@@ -194,6 +250,18 @@ func runDrain(ctx context.Context, nodeArgs []string, opts *drainOptions) error 
 	return nil
 }
 
+// sliceToSet converts a slice of strings into a set (map[string]bool).
+func sliceToSet(ss []string) map[string]bool {
+	if len(ss) == 0 {
+		return nil
+	}
+	m := make(map[string]bool, len(ss))
+	for _, s := range ss {
+		m[s] = true
+	}
+	return m
+}
+
 // resolveNodeNames returns the list of node names to drain. When nodeSelector
 // is non-empty, it lists nodes matching that label selector; otherwise it
 // returns nodeArgs directly.
@@ -217,4 +285,85 @@ func resolveNodeNames(ctx context.Context, client *k8s.Client, nodeArgs []string
 		names[i] = n.Name
 	}
 	return names, nil
+}
+
+// applyProfile loads the named profile from the config file and applies its
+// values to opts for any flag that was not explicitly set on the command line.
+// CLI flags always take precedence over profile values.
+func applyProfile(cmd *cobra.Command, opts *drainOptions) error {
+	cfgPath := opts.configFile
+	if cfgPath == "" {
+		cfgPath = os.Getenv("KUBECTL_SAFED_CONFIG")
+	}
+	if cfgPath == "" {
+		var err error
+		cfgPath, err = config.DefaultConfigPath()
+		if err != nil {
+			return err
+		}
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return err
+	}
+	prof, err := cfg.GetProfile(opts.profile)
+	if err != nil {
+		return err
+	}
+
+	changed := func(name string) bool { return cmd.Flags().Changed(name) }
+
+	if prof.Timeout != nil && !changed("timeout") {
+		opts.timeout = prof.Timeout.D
+	}
+	if prof.RolloutTimeout != nil && !changed("rollout-timeout") {
+		opts.rolloutTimeout = prof.RolloutTimeout.D
+	}
+	if prof.PodVacateTimeout != nil && !changed("pod-vacate-timeout") {
+		opts.podVacateTimeout = prof.PodVacateTimeout.D
+	}
+	if prof.EvictionTimeout != nil && !changed("eviction-timeout") {
+		opts.evictionTimeout = prof.EvictionTimeout.D
+	}
+	if prof.PDBRetryInterval != nil && !changed("pdb-retry-interval") {
+		opts.pdbRetryInterval = prof.PDBRetryInterval.D
+	}
+	if prof.PollInterval != nil && !changed("poll-interval") {
+		opts.pollInterval = prof.PollInterval.D
+	}
+	if prof.MaxConcurrency != nil && !changed("max-concurrency") {
+		opts.maxConcurrency = *prof.MaxConcurrency
+	}
+	if prof.NodeConcurrency != nil && !changed("node-concurrency") {
+		opts.nodeConcurrency = *prof.NodeConcurrency
+	}
+	if prof.Preflight != "" && !changed("preflight") {
+		opts.preflight = prof.Preflight
+	}
+	if prof.LogFormat != "" && !changed("log-format") {
+		opts.logFormat = prof.LogFormat
+	}
+	if prof.DryRun != nil && !changed("dry-run") {
+		opts.dryRun = *prof.DryRun
+	}
+	if prof.Force != nil && !changed("force") {
+		opts.force = *prof.Force
+	}
+	if prof.IgnoreDaemonSets != nil && !changed("ignore-daemonsets") {
+		opts.skipDaemonSets = *prof.IgnoreDaemonSets
+	}
+	if prof.DeleteEmptyDir != nil && !changed("delete-emptydir-data") {
+		opts.deleteEmptyDir = *prof.DeleteEmptyDir
+	}
+	if prof.ForceDeleteStandalone != nil && !changed("force-delete-standalone") {
+		opts.forceDeleteStandalone = *prof.ForceDeleteStandalone
+	}
+	if prof.UncordonOnFailure != nil && !changed("uncordon-on-failure") {
+		opts.uncordonOnFailure = *prof.UncordonOnFailure
+	}
+	if prof.EmitEvents != nil && !changed("emit-events") {
+		opts.emitEvents = *prof.EmitEvents
+	}
+	return nil
 }

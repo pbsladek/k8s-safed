@@ -292,3 +292,91 @@ func TestFinder_FindForNode_MultipleWorkloads(t *testing.T) {
 		t.Error("expected a StatefulSet workload")
 	}
 }
+
+// --------------------------------------------------------------------------
+// parseDrainPriority (via FindForNode — priority flows from annotation)
+// --------------------------------------------------------------------------
+
+func makeDeploymentWithAnnotation(ns, name, annotationKey, annotationValue string) appsv1.Deployment {
+	dep := makeDeployment(ns, name)
+	dep.Annotations = map[string]string{annotationKey: annotationValue}
+	return dep
+}
+
+func TestFinder_FindForNode_Priority_Default(t *testing.T) {
+	// A Deployment without the annotation should get DefaultDrainPriority.
+	dep := makeDeployment("default", "api")
+	rs := makeRS("default", "api-rs1", "api")
+	pod := makePod("default", "api-pod1", []metav1.OwnerReference{ownerRef("ReplicaSet", "api-rs1")})
+
+	client := fake.NewSimpleClientset(&dep, &rs, &pod)
+	f := workload.NewFinder(client)
+
+	wls, err := f.FindForNode(context.Background(), "node1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wls) != 1 {
+		t.Fatalf("expected 1 workload, got %d", len(wls))
+	}
+	if wls[0].Priority != workload.DefaultDrainPriority {
+		t.Errorf("Priority = %d, want DefaultDrainPriority (%d)", wls[0].Priority, workload.DefaultDrainPriority)
+	}
+}
+
+func TestFinder_FindForNode_Priority_FromAnnotation(t *testing.T) {
+	dep := makeDeploymentWithAnnotation("default", "api", workload.DrainPriorityAnnotation, "10")
+	rs := makeRS("default", "api-rs1", "api")
+	pod := makePod("default", "api-pod1", []metav1.OwnerReference{ownerRef("ReplicaSet", "api-rs1")})
+
+	client := fake.NewSimpleClientset(&dep, &rs, &pod)
+	f := workload.NewFinder(client)
+
+	wls, err := f.FindForNode(context.Background(), "node1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wls) != 1 {
+		t.Fatalf("expected 1 workload, got %d", len(wls))
+	}
+	if wls[0].Priority != 10 {
+		t.Errorf("Priority = %d, want 10", wls[0].Priority)
+	}
+}
+
+func TestFinder_FindForNode_Priority_InvalidAnnotation_UsesDefault(t *testing.T) {
+	dep := makeDeploymentWithAnnotation("default", "api", workload.DrainPriorityAnnotation, "not-a-number")
+	rs := makeRS("default", "api-rs1", "api")
+	pod := makePod("default", "api-pod1", []metav1.OwnerReference{ownerRef("ReplicaSet", "api-rs1")})
+
+	client := fake.NewSimpleClientset(&dep, &rs, &pod)
+	f := workload.NewFinder(client)
+
+	wls, err := f.FindForNode(context.Background(), "node1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wls[0].Priority != workload.DefaultDrainPriority {
+		t.Errorf("invalid annotation should fall back to DefaultDrainPriority, got %d", wls[0].Priority)
+	}
+}
+
+func TestFinder_FindForNode_StatefulSet_Priority(t *testing.T) {
+	sts := makeStatefulSet("default", "db")
+	sts.Annotations = map[string]string{workload.DrainPriorityAnnotation: "200"}
+	pod := makePod("default", "db-0", []metav1.OwnerReference{ownerRef("StatefulSet", "db")})
+
+	client := fake.NewSimpleClientset(&sts, &pod)
+	f := workload.NewFinder(client)
+
+	wls, err := f.FindForNode(context.Background(), "node1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wls) != 1 {
+		t.Fatalf("expected 1 workload, got %d", len(wls))
+	}
+	if wls[0].Priority != 200 {
+		t.Errorf("Priority = %d, want 200", wls[0].Priority)
+	}
+}

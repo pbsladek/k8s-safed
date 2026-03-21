@@ -6,7 +6,7 @@ LDFLAGS    := -s -w
 # Respect GOBIN / PATH install location; default to /usr/local/bin.
 INSTALL_DIR ?= /usr/local/bin
 
-.PHONY: all build test vet lint fmt check install clean snapshot help
+.PHONY: all build test vet lint fmt check install clean snapshot help e2e e2e-run
 
 all: check build ## Run checks then build (default)
 
@@ -36,6 +36,14 @@ lint: ## Run golangci-lint (requires golangci-lint to be installed)
 	golangci-lint run ./...
 
 check: fmt vet test ## Format, vet, and test
+
+## ── E2E tests ─────────────────────────────────────────────────────────────────
+
+e2e: ## Run e2e tests against a real k3d cluster (requires k3d in PATH)
+	go test -v -tags=e2e -count=1 -timeout=35m ./e2e/...
+
+e2e-run: ## Run a single e2e test by name: make e2e-run TEST=TestDrain_Basic
+	go test -v -tags=e2e -count=1 -timeout=20m -run $(TEST) ./e2e/...
 
 ## ── Dependencies ─────────────────────────────────────────────────────────────
 

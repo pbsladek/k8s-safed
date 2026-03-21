@@ -15,6 +15,10 @@ make check          # fmt + vet + test (default CI gate)
 make build          # compile to ./kubectl-safed
 make install        # install to $GOPATH/bin
 go run . drain --help
+
+# E2E (requires k3d + helm in PATH)
+make e2e                             # full suite against a real k3d cluster
+make e2e-run TEST=TestDrain_NATS     # run a single test
 ```
 
 ## Key decisions
@@ -74,12 +78,24 @@ pkg/
   drain/
     drain.go                    Drainer: full drain orchestration
     printer.go                  structured stdout/JSON output (LogFormat)
+e2e/
+  main_test.go                  TestMain: build binary + create k3d cluster + install Helm charts
+  drain_test.go                 18 end-to-end test scenarios
+  framework/
+    cluster.go                  k3d cluster lifecycle (create/destroy/node names)
+    client.go                   Kubernetes client helpers + wait utilities
+    binary.go                   kubectl-safed subprocess runner (Drain/DrainNodes/etc.)
+    helm.go                     Helm release definitions (NATS, Grafana, kube-state-metrics)
+    workloads.go                raw manifest constants + pod-placement helpers
+hack/ci/
+  collect-diagnostics.sh        CI failure dump: nodes, pods, events, logs
 scripts/
   update-krew-manifest.py       rewrites plugin.yaml with SHA256s from dist/checksums.txt
   commit-manifest.sh            git add/commit/push plugin.yaml to main [skip ci]
   submit-to-krew-index.sh       opens a PR against kubernetes-sigs/krew-index
 .github/workflows/
-  ci.yml                        build + vet + test + goreleaser check on push/PR
+  ci.yml                        build + vet + test (unit) + goreleaser check on push/PR
+  e2e.yml                       e2e tests: k3d + NATS + Grafana (nightly + workflow_dispatch)
   release.yml                   goreleaser → update manifest → upload → commit
 .goreleaser.yaml                multi-arch build (linux/darwin/windows × amd64/arm64)
 plugin.yaml                     krew manifest (auto-updated by release workflow)
@@ -190,6 +206,81 @@ This triggers `.github/workflows/release.yml` which:
 
 Krew-index submission is handled by `scripts/submit-to-krew-index.sh` in a
 separate (currently commented-out) workflow job. See README for setup.
+
+## E2E test suite
+
+Tests live under `e2e/` behind the `//go:build e2e` tag. They require k3d and
+helm in `$PATH` and are NOT run by `make check` or the CI `test` job.
+
+### Infrastructure
+
+| Component | Helm chart | Purpose |
+|---|---|---|
+| NATS | `nats/nats` (3 replicas) | StatefulSet rolling restart target |
+| Grafana | `grafana/grafana` (3 replicas) | Deployment rolling restart target |
+| kube-state-metrics | `prometheus-community/kube-state-metrics` | Lightweight always-present Deployment |
+
+All charts use `whenUnsatisfiable: ScheduleAnyway` (not `DoNotSchedule`) so
+pods can reschedule to the server node during multi-node drain tests.
+
+### Cluster topology
+
+k3d cluster with 1 server + 2 agents (3 nodes total). Agent nodes are named
+`k3d-<cluster>-agent-N`. Tests drain agent nodes only to avoid disrupting the
+control plane. `K3S_IMAGE` env var is forwarded to `k3d cluster create --image`
+so CI can pin a specific k3s release.
+
+### Key e2e patterns
+
+- **Before/after annotation pattern** — capture `restartedAt` before the drain,
+  assert it changed (not just non-empty) to prove kubectl-safed ran vs. a
+  pre-existing restart.
+- **`t.Skip` not `t.Fatal` for pod placement** — if no agent node has the
+  target pod (valid: scheduler may have placed it on the server), skip rather
+  than fail. Tests re-use the shared cluster so pod placement varies.
+- **`agentNodeWithPod`** — 30 s poll for a Running pod matching a label
+  selector on any agent node; calls `t.Skipf` if not found.
+- **`waitAllReady`** — called at the top of every drain test to ensure NATS
+  and Grafana have fully converged from the previous test's rollout.
+- **`WaitForPodsOnAgentNodes`** — called after `TestDrain_MultiNode` uncordons
+  both agents, to prevent all subsequent tests from silent-skipping because
+  pods rescheduled to the server during the dual-agent drain.
+- **`NodeHasActivePodsWithSelector`** — label-filtered version of
+  `NodeHasActivePods`, used by `TestDrain_MultipleWorkloads` to find a node
+  hosting both NATS and Grafana pods.
+
+### E2E test inventory (18 tests)
+
+| Test | What it covers |
+|---|---|
+| `TestDrain_NodeNotFound` | Non-zero exit for unknown node |
+| `TestDrain_DryRun` | No cordon, no annotation change |
+| `TestDrain_NATS` | StatefulSet rolling restart + pod vacate |
+| `TestDrain_Grafana` | Deployment rolling restart + pod vacate |
+| `TestDrain_MultipleWorkloads` | Both NATS + Grafana restarted on shared node |
+| `TestDrain_Priority` | NATS (priority 200) restarts before Grafana (priority 100) |
+| `TestDrain_SkipWorkload` | `--skip-workload` leaves Grafana untouched |
+| `TestDrain_OnlyWorkload` | `--only-workload` leaves Grafana untouched |
+| `TestDrain_Preflight_WarnMode` | Single-replica risk logged, drain continues |
+| `TestDrain_Preflight_StrictMode` | Single-replica risk aborts drain before cordon |
+| `TestDrain_NodeSelector` | `--selector` targets labelled node only |
+| `TestDrain_MultiNode` | Both agents drained with `--node-concurrency 2` |
+| `TestDrain_EmitEvents` | `--emit-events` produces Draining/Drained node events |
+| `TestDrain_DaemonSetNotRestarted` | DaemonSet pods never receive restartedAt |
+| `TestDrain_CheckpointResume` | `--resume` after clean drain runs as fresh drain |
+| `TestDrain_PDBBlockedEviction` | PDB (maxUnavailable=0) blocks eviction of standalone pod; drain fails after `--eviction-timeout` |
+| `TestDrain_CrashLoopAbort` | Drain aborts fast when rolling-restart pod enters CrashLoopBackOff |
+| `TestDrain_UncordonOnFailure` | `--uncordon-on-failure` restores node schedulability after CrashLoop abort |
+
+### Timeouts
+
+| Scope | Value | Where set |
+|---|---|---|
+| `go test -timeout` | 35m (local) / 30m (CI) | Makefile / e2e.yml |
+| TestMain setup context | 28m | `e2e/main_test.go` |
+| CI job `timeout-minutes` | 40 | `.github/workflows/e2e.yml` |
+| Per-test drain context | 8m (`drainTimeout`) | `e2e/drain_test.go` |
+| Per-workload ready wait | 5m (`workloadReady`) | `e2e/drain_test.go` |
 
 ## Coding conventions
 

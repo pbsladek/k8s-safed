@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -83,6 +84,26 @@ type Options struct {
 	// logs findings and continues. PreflightModeStrict aborts on any risk-level
 	// issue. PreflightModeOff skips all checks.
 	Preflight PreflightMode
+	// SkipWorkloads is a set of "Kind/namespace/name" keys to exclude from
+	// rolling restarts. Skipped workloads still fall through to eviction normally.
+	// Mutually exclusive with OnlyWorkloads.
+	SkipWorkloads map[string]bool
+	// OnlyWorkloads restricts rolling restarts to exactly this set of
+	// "Kind/namespace/name" keys; all others are left untouched.
+	// Mutually exclusive with SkipWorkloads.
+	OnlyWorkloads map[string]bool
+	// EmitEvents causes the drainer to emit Kubernetes Events to the node and
+	// workload objects during drain. Requires events/create RBAC permission on
+	// the core API group. Disabled by default to avoid surprising users.
+	EmitEvents bool
+	// Resume causes the drainer to skip workloads that are already recorded as
+	// completed in the checkpoint file at CheckpointPath, allowing an
+	// interrupted drain to be continued without redundant rolling restarts.
+	Resume bool
+	// CheckpointPath is the local file path used to persist drain progress.
+	// When empty and Resume is true, the path is derived from the kubeconfig
+	// context and node name. Ignored when Resume is false.
+	CheckpointPath string
 }
 
 // Drainer orchestrates the safe drain sequence.
@@ -90,6 +111,7 @@ type Drainer struct {
 	opts   Options
 	client kubernetes.Interface
 	finder *workload.Finder
+	events *EventEmitter
 }
 
 // pollInterval returns the configured poll interval, falling back to 5 s.
@@ -132,6 +154,7 @@ func NewDrainer(opts Options) *Drainer {
 		opts:   opts,
 		client: opts.Client.Kubernetes,
 		finder: workload.NewFinder(opts.Client.Kubernetes),
+		events: NewEventEmitter(opts.Client.Kubernetes, opts.Out, opts.EmitEvents),
 	}
 }
 
@@ -188,6 +211,10 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 		}
 	}
 
+	// Filter workloads per --skip-workload / --only-workload before pre-flight
+	// so pre-flight only scans workloads that will actually be restarted.
+	workloads = d.filterWorkloads(workloads)
+
 	// Step 3: Pre-flight checks — surface risks before making any cluster changes.
 	if d.opts.Preflight != PreflightModeOff {
 		if err := d.runPreflight(ctx, workloads); err != nil {
@@ -200,6 +227,17 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 	if err != nil {
 		return err
 	}
+	d.events.NodeEvent(ctx, d.opts.NodeName, "Draining",
+		fmt.Sprintf("kubectl-safed: beginning drain of %q (%d workload(s))", d.opts.NodeName, len(workloads)),
+		corev1.EventTypeNormal)
+	// Emit DrainFailed event on any error path after the cordon.
+	defer func() {
+		if retErr != nil {
+			d.events.NodeEvent(context.Background(), d.opts.NodeName, "DrainFailed",
+				fmt.Sprintf("kubectl-safed: drain of %q failed: %v", d.opts.NodeName, retErr),
+				corev1.EventTypeWarning)
+		}
+	}()
 	// If UncordonOnFailure is set and we were the ones who cordoned the node,
 	// schedule an uncordon on any failure path. We use a fresh context because
 	// the drain context may already be cancelled (e.g. on --timeout expiry).
@@ -221,12 +259,46 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 		return err
 	}
 
+	// Delete the checkpoint on successful completion — it's no longer needed.
+	if d.opts.CheckpointPath != "" {
+		if err := DeleteCheckpoint(d.opts.CheckpointPath); err != nil {
+			out.Warnf(d.opts.NodeName, "failed to remove checkpoint: %v", err)
+		}
+	}
+
 	if d.opts.DryRun {
-		out.DryRunf(d.opts.NodeName,"Dry-run complete — no changes were made to %q", d.opts.NodeName)
+		out.DryRunf(d.opts.NodeName, "Dry-run complete — no changes were made to %q", d.opts.NodeName)
 	} else {
-		out.Elapsed(start, d.opts.NodeName,fmt.Sprintf("Drained %q", d.opts.NodeName))
+		elapsed := time.Since(start).Round(time.Second)
+		d.events.NodeEvent(ctx, d.opts.NodeName, "Drained",
+			fmt.Sprintf("kubectl-safed: drain of %q complete (%s)", d.opts.NodeName, elapsed),
+			corev1.EventTypeNormal)
+		out.Elapsed(start, d.opts.NodeName, fmt.Sprintf("Drained %q", d.opts.NodeName))
 	}
 	return nil
+}
+
+// filterWorkloads applies SkipWorkloads / OnlyWorkloads filtering and logs
+// each exclusion. It is a no-op when both maps are empty.
+func (d *Drainer) filterWorkloads(workloads []workload.Workload) []workload.Workload {
+	if len(d.opts.SkipWorkloads) == 0 && len(d.opts.OnlyWorkloads) == 0 {
+		return workloads
+	}
+	out := d.opts.Out
+	filtered := workloads[:0:0] // zero-length, same backing array avoided
+	for _, w := range workloads {
+		key := fmt.Sprintf("%s/%s/%s", w.Kind, w.Namespace, w.Name)
+		if len(d.opts.OnlyWorkloads) > 0 && !d.opts.OnlyWorkloads[key] {
+			out.Infof(d.opts.NodeName, "Skipping %s (not in --only-workload list)", wSubject(w))
+			continue
+		}
+		if d.opts.SkipWorkloads[key] {
+			out.Infof(d.opts.NodeName, "Skipping %s (--skip-workload)", wSubject(w))
+			continue
+		}
+		filtered = append(filtered, w)
+	}
+	return filtered
 }
 
 // runWorkloads dispatches rolling restarts according to MaxConcurrency.
@@ -246,6 +318,49 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 		return nil
 	}
 
+	// Sort by annotation priority (lower = first). SliceStable preserves
+	// discovery order within the same priority level.
+	sort.SliceStable(workloads, func(i, j int) bool {
+		return workloads[i].Priority < workloads[j].Priority
+	})
+
+	// Load checkpoint if resuming. Filter out already-completed workloads.
+	var cp *Checkpoint
+	if d.opts.Resume && d.opts.CheckpointPath != "" {
+		var err error
+		cp, err = LoadCheckpoint(d.opts.CheckpointPath)
+		if err != nil {
+			return fmt.Errorf("loading checkpoint: %w", err)
+		}
+		remaining := workloads[:0:0]
+		for _, w := range workloads {
+			if cp.IsDone(w) {
+				d.opts.Out.Infof(d.opts.NodeName, "Skipping %s (already completed per checkpoint)", wSubject(w))
+				continue
+			}
+			remaining = append(remaining, w)
+		}
+		workloads = remaining
+		if len(workloads) == 0 {
+			d.opts.Out.Info(d.opts.NodeName, "All workloads already completed per checkpoint")
+			return nil
+		}
+	}
+	if cp == nil {
+		cp = &Checkpoint{Completed: make(map[string]bool)}
+	}
+
+	// saveCP persists the checkpoint after each successful workload (best-effort).
+	saveCP := func(w workload.Workload) {
+		if d.opts.CheckpointPath == "" {
+			return
+		}
+		cp.MarkDone(w)
+		if err := cp.Save(d.opts.CheckpointPath); err != nil {
+			d.opts.Out.Warnf(d.opts.NodeName, "failed to save checkpoint: %v", err)
+		}
+	}
+
 	maxC := d.opts.MaxConcurrency
 	out := d.opts.Out
 
@@ -257,6 +372,7 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 			if err := d.rollingRestart(ctx, w); err != nil {
 				return err
 			}
+			saveCP(w)
 			if !d.opts.DryRun {
 				out.Elapsed(t0, wSubject(w), "Complete")
 			}
@@ -304,8 +420,13 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 			return err
 		}
 
+		// Save checkpoint for all workloads in the completed batch.
+		for _, w := range batch {
+			saveCP(w)
+		}
+
 		if totalBatches > 1 {
-			out.Infof(d.opts.NodeName,"batch %d/%d: all %d workload(s) complete",
+			out.Infof(d.opts.NodeName, "batch %d/%d: all %d workload(s) complete",
 				batchNum, totalBatches, len(batch))
 		}
 	}
@@ -378,6 +499,10 @@ func (d *Drainer) rollingRestart(ctx context.Context, w workload.Workload) error
 		return nil
 	}
 
+	d.events.WorkloadEvent(ctx, w, "RollingRestartTriggered",
+		fmt.Sprintf("kubectl-safed: rolling restart triggered on node drain of %q", d.opts.NodeName),
+		corev1.EventTypeNormal)
+
 	switch w.Kind {
 	case workload.KindDeployment:
 		preGen, err := d.restartDeployment(ctx, w.Namespace, w.Name)
@@ -405,6 +530,10 @@ func (d *Drainer) rollingRestart(ctx context.Context, w workload.Workload) error
 	if err := d.waitForPodsOffNode(ctx, w); err != nil {
 		return fmt.Errorf("%s pods did not leave node %q: %w", w, d.opts.NodeName, err)
 	}
+
+	d.events.WorkloadEvent(ctx, w, "RollingRestartComplete",
+		fmt.Sprintf("kubectl-safed: rolling restart complete, pods cleared from %q", d.opts.NodeName),
+		corev1.EventTypeNormal)
 
 	return nil
 }
