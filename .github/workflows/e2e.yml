@@ -1,6 +1,12 @@
 name: E2E Tests
 
 on:
+  push:
+    branches: [main]
+    tags-ignore:
+      - "v*"
+  pull_request:
+    branches: [main]
   workflow_dispatch: {}
   schedule:
     # Nightly at 03:00 UTC on main
