@@ -16,20 +16,20 @@ terminated, giving you a zero-downtime drain.
 1. Validate   – confirm the target node exists
 2. Discover   – find every Deployment and StatefulSet with pods on the node
                 (Pod → ReplicaSet → Deployment ownership is fully resolved)
-3. Pre-flight – scan discovered workloads for downtime risks before making any
-                cluster changes: single-replica Deployments, Recreate strategy,
-                stateful services (postgres, redis, kafka, etc.), PDBs with 0
-                disruptions allowed. Use --preflight=strict to abort on risks,
+3. Filter     – apply --skip-workload / --only-workload before any cluster changes
+4. Pre-flight – scan discovered workloads for downtime risks: single-replica
+                Deployments, Recreate strategy, stateful services, PDBs with 0
+                disruptions allowed. Use --preflight=strict to abort on any risk,
                 --preflight=off to skip entirely.
-4. Cordon     – mark the node unschedulable so no new pods are scheduled
-5. Restart    – patch each workload's pod template with a restartedAt
-                annotation (identical to `kubectl rollout restart`)
-6. Wait       – poll rollout status until all replicas are updated and ready;
+5. Cordon     – mark the node unschedulable so no new pods are scheduled there
+6. Restart    – patch each workload's pod template with a restartedAt annotation
+                (identical to `kubectl rollout restart`)
+7. Wait       – poll rollout status until all replicas are updated and ready;
                 fail fast on ProgressDeadlineExceeded, CrashLoopBackOff,
                 ImagePullBackOff, or ErrImagePull
-7. Verify     – confirm all of that workload's pods have left the node
-                before moving to the next one
-8. Evict      – evict any remaining pods (DaemonSets, Jobs, standalones)
+8. Verify     – confirm all of that workload's pods have left the node before
+                moving to the next one
+9. Evict      – evict any remaining pods (DaemonSets, Jobs, standalones)
                 controlled by --ignore-daemonsets, --force, --delete-emptydir-data
 ```
 
@@ -308,11 +308,12 @@ the discovered workloads and surfaces potential issues:
 | Recreate strategy | **risk** | `strategy.type == Recreate` — all pods are terminated before new ones start |
 | Single-replica StatefulSet | **risk** | `spec.replicas == 1` — rolling restart causes downtime |
 | Multi-replica StatefulSet | note | Pods restart one at a time in reverse ordinal order |
-| Known stateful service | note | Name matches a known stateful pattern (postgres, redis, kafka, etc.) |
+| Known stateful service | note | Name matches a known stateful pattern (see below) |
 | PDB with 0 disruptions | note | `status.disruptionsAllowed == 0` — eviction of remaining pods may be blocked |
 
-**Risk-level** findings are prefixed with `RISK:` in the log; informational
-findings are prefixed with `note:`.
+**Risk-level** findings cause a non-zero exit under `--preflight=strict` and are
+prefixed with `RISK:` in the log. Informational findings are prefixed with
+`note:` and never abort the drain.
 
 ```
 [safed] 15:04:05  worker-1                          info    Running pre-flight checks...
@@ -322,10 +323,16 @@ findings are prefixed with `note:`.
 ```
 
 Stateful service detection matches these patterns (case-insensitive substring):
-`postgres`, `pgbouncer`, `pgpool`, `patroni`, `mysql`, `mariadb`, `percona`,
-`vitess`, `redis`, `keydb`, `mongo`, `elasticsearch`, `opensearch`, `solr`,
-`kafka`, `zookeeper`, `redpanda`, `rabbitmq`, `nats`, `etcd`, `cassandra`,
-`scylla`, `cockroach`, `clickhouse`, `yugabyte`, `minio`, `vault`, `memcached`.
+
+`postgres`, `postgresql`, `pgbouncer`, `pgpool`, `pgpool2`, `patroni`,
+`mysql`, `mariadb`, `percona`, `vitess`,
+`redis`, `keydb`,
+`mongo`, `mongodb`,
+`elasticsearch`, `opensearch`, `solr`,
+`kafka`, `zookeeper`, `redpanda`,
+`rabbitmq`, `nats`,
+`etcd`, `cassandra`, `scylla`, `cockroach`, `clickhouse`, `yugabyte`,
+`minio`, `vault`, `memcached`
 
 Use `--preflight=strict` to abort the drain when any risk-level finding is
 detected. Use `--preflight=off` to skip all checks.
@@ -385,7 +392,7 @@ By default the following pods are **never** evicted or restarted:
 | Mirror pods (static pods) | Managed directly by kubelet; cannot be evicted via API |
 | `Succeeded` / `Failed` pods | Already terminal; nothing to do |
 | Already-terminating pods | `DeletionTimestamp` is set; kubelet is cleaning them up |
-| DaemonSet pods | Run on every node by design (override with `--skip-daemon-sets=false`) |
+| DaemonSet pods | Run on every node by design (override with `--ignore-daemonsets=false`) |
 | Pods with `emptyDir` | Eviction causes data loss (override with `--delete-emptydir-data`) |
 | Standalone pods | No owner reference; require `--force` |
 | Job-owned pods | Not rolling-restart managed; require `--force` |
@@ -551,8 +558,8 @@ make test-v  # verbose unit tests
 ### End-to-end tests
 
 E2E tests run the compiled `kubectl-safed` binary against a real multi-node
-Kubernetes cluster created locally with [k3d](https://k3d.io). They require
-`k3d` and `helm` in your `$PATH`.
+Kubernetes cluster created with [k3d](https://k3d.io). They require `k3d` and
+`helm` in your `$PATH`.
 
 ```bash
 # Run the full suite (creates a 3-node k3d cluster, installs NATS + Grafana via Helm)
@@ -567,8 +574,9 @@ restarts, multi-node drains, pre-flight checks, priority ordering, PDB-blocked
 eviction, CrashLoopBackOff fail-fast, `--uncordon-on-failure`, workload
 filtering, checkpoint/resume, and Kubernetes Event emission.
 
-E2E tests also run automatically in CI (nightly at 03:00 UTC and on
-`workflow_dispatch`) via `.github/workflows/e2e.yml`.
+E2E tests also run automatically in CI on every push and pull request to `main`,
+nightly at 03:00 UTC, and on `workflow_dispatch` via
+`.github/workflows/e2e.yml`.
 
 ---
 

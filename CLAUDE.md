@@ -78,6 +78,11 @@ pkg/
   drain/
     drain.go                    Drainer: full drain orchestration
     printer.go                  structured stdout/JSON output (LogFormat)
+    preflight.go                pre-flight checks + stateful service detection
+    events.go                   Kubernetes Event emission
+    checkpoint.go               checkpoint read/write/delete for --resume
+  config/
+    config.go                   safed.yaml profile loading
 e2e/
   main_test.go                  TestMain: build binary + create k3d cluster + install Helm charts
   drain_test.go                 18 end-to-end test scenarios
@@ -94,8 +99,8 @@ scripts/
   commit-manifest.sh            git add/commit/push plugin.yaml to main [skip ci]
   submit-to-krew-index.sh       opens a PR against kubernetes-sigs/krew-index
 .github/workflows/
-  ci.yml                        build + vet + test (unit) + goreleaser check on push/PR
-  e2e.yml                       e2e tests: k3d + NATS + Grafana (nightly + workflow_dispatch)
+  ci.yml                        build + vet + unit tests + goreleaser check on push/PR
+  e2e.yml                       e2e tests on push/PR/nightly/workflow_dispatch
   release.yml                   goreleaser → update manifest → upload → commit
 .goreleaser.yaml                multi-arch build (linux/darwin/windows × amd64/arm64)
 plugin.yaml                     krew manifest (auto-updated by release workflow)
@@ -105,9 +110,13 @@ plugin.yaml                     krew manifest (auto-updated by release workflow)
 
 1. Apply `--timeout` deadline to the context (if set)
 2. `GET` node — validate it exists, log kernel version + ready status
-3. `PATCH` node `spec.unschedulable=true` — cordon (idempotent)
-4. `LIST` pods on node → resolve owners via `workload.Finder.FindForNode`
-5. For each workload (sequential, batch, or fully parallel per `--max-concurrency`):
+3. `LIST` pods on node → resolve owners via `workload.Finder.FindForNode`
+4. Apply `--skip-workload` / `--only-workload` filtering
+5. Run pre-flight checks (unless `--preflight=off`)
+6. `PATCH` node `spec.unschedulable=true` — cordon (idempotent); record whether
+   this run performed the cordon (for `--uncordon-on-failure`)
+7. Emit "Draining" event on node (if `--emit-events`)
+8. For each workload (sequential, batch, or fully parallel per `--max-concurrency`):
    a. `PATCH` pod template annotation `kubectl.kubernetes.io/restartedAt`
    b. Capture `targetGeneration` from PATCH response
    c. Poll deployment/STS status until `ObservedGeneration >= targetGeneration`
@@ -116,7 +125,9 @@ plugin.yaml                     krew manifest (auto-updated by release workflow)
       `CrashLoopBackOff` (after first exit), `ImagePullBackOff`, `ErrImagePull`
    e. Poll pods on node matching workload's label selector until none are
       active (excluding terminating + terminal) — bounded by `--pod-vacate-timeout`
-6. `LIST` remaining pods → evict eligible ones with PDB-aware retry
+   f. Write completed workload to checkpoint file (if `--resume` path is set)
+9. `LIST` remaining pods → evict eligible ones with PDB-aware retry
+10. Delete checkpoint file on success; emit "Drained" event (if `--emit-events`)
 
 ## Rollout completion conditions
 
@@ -146,6 +157,9 @@ plugin.yaml                     krew manifest (auto-updated by release workflow)
 | `N > 1` | Batches of N — workloads in a batch run concurrently via `errgroup`; first error cancels siblings |
 | `0` | All workloads concurrently — equivalent to N = len(workloads) |
 
+Workloads are sorted by `kubectl.safed.io/drain-priority` annotation before
+concurrency is applied (lower = first; default priority 100).
+
 ## Logging (`--log-format`)
 
 | Format | Description |
@@ -153,16 +167,21 @@ plugin.yaml                     krew manifest (auto-updated by release workflow)
 | `plain` (default) | `[safed] HH:MM:SS  Subject(32char)  level   message` — aligned columns, grep-friendly |
 | `json` | One JSON object per line: `{"ts":"RFC3339","level":"...","subject":"...","msg":"..."}` |
 
-Level labels: `info`, `start`, `done`, `poll`, `dryrun`
-Subjects: `node` for drain-level events; `Kind/namespace/name` for workloads; `Pod/namespace/name` for eviction.
+Level labels: `info`, `start`, `done`, `poll`, `dryrun`, `warn`
+
+Subjects: node name for drain-level events; `Kind/namespace/name` for workloads;
+`Pod/namespace/name` for eviction.
 
 Grep patterns:
 ```bash
 grep "start"                   # all workloads that began restarting
 grep "done"                    # all completions
 grep "poll"                    # progress detail only
+grep "warn"                    # all pre-flight findings
+grep "RISK"                    # risk-level findings only
 grep "Deployment/default/api"  # every line for one workload
 grep "dryrun"                  # dry-run preview lines
+grep "worker-1"                # all events for one node (multi-node drains)
 ```
 
 ## Tunable timeouts
@@ -190,22 +209,8 @@ grep "dryrun"                  # dry-run preview lines
   polling on every tick.
 - **Concurrent `kubectl rollout restart`** — using post-patch generation means
   a concurrent restart between our GET and PATCH cannot cause false completion.
-
-## Release process
-
-```bash
-git tag v0.x.0
-git push origin v0.x.0
-```
-
-This triggers `.github/workflows/release.yml` which:
-1. Runs GoReleaser → builds 5 platform binaries, creates GitHub release
-2. Runs `scripts/update-krew-manifest.py` → rewrites `plugin.yaml`
-3. Uploads `plugin.yaml` to the GitHub release
-4. Runs `scripts/commit-manifest.sh` → commits updated `plugin.yaml` to `main`
-
-Krew-index submission is handled by `scripts/submit-to-krew-index.sh` in a
-separate (currently commented-out) workflow job. See README for setup.
+- **`--uncordon-on-failure`** — only uncordons if this drain run performed the
+  cordon; will not uncordon a node that was already cordoned before the run.
 
 ## E2E test suite
 
@@ -216,38 +221,34 @@ helm in `$PATH` and are NOT run by `make check` or the CI `test` job.
 
 | Component | Helm chart | Purpose |
 |---|---|---|
-| NATS | `nats/nats` (3 replicas) | StatefulSet rolling restart target |
-| Grafana | `grafana/grafana` (3 replicas) | Deployment rolling restart target |
+| NATS | `nats/nats` (3 replicas) | StatefulSet rolling restart target; drain priority 200 |
+| Grafana | `grafana/grafana` (3 replicas) | Deployment rolling restart target; drain priority 100 |
 | kube-state-metrics | `prometheus-community/kube-state-metrics` | Lightweight always-present Deployment |
 
-All charts use `whenUnsatisfiable: ScheduleAnyway` (not `DoNotSchedule`) so
-pods can reschedule to the server node during multi-node drain tests.
+All charts use `whenUnsatisfiable: ScheduleAnyway` so pods can reschedule to
+the server node during multi-node drain tests without blocking scheduling.
 
 ### Cluster topology
 
-k3d cluster with 1 server + 2 agents (3 nodes total). Agent nodes are named
-`k3d-<cluster>-agent-N`. Tests drain agent nodes only to avoid disrupting the
-control plane. `K3S_IMAGE` env var is forwarded to `k3d cluster create --image`
-so CI can pin a specific k3s release.
+k3d cluster: 1 server + 2 agents (3 nodes total). Tests drain agent nodes only.
+`K3S_IMAGE` env var is forwarded to `k3d cluster create --image` so CI can pin
+a specific k3s release.
 
 ### Key e2e patterns
 
 - **Before/after annotation pattern** — capture `restartedAt` before the drain,
-  assert it changed (not just non-empty) to prove kubectl-safed ran vs. a
-  pre-existing restart.
+  assert it changed (not just non-empty) to prove kubectl-safed triggered a new
+  restart vs. an existing annotation.
 - **`t.Skip` not `t.Fatal` for pod placement** — if no agent node has the
-  target pod (valid: scheduler may have placed it on the server), skip rather
-  than fail. Tests re-use the shared cluster so pod placement varies.
-- **`agentNodeWithPod`** — 30 s poll for a Running pod matching a label
-  selector on any agent node; calls `t.Skipf` if not found.
-- **`waitAllReady`** — called at the top of every drain test to ensure NATS
-  and Grafana have fully converged from the previous test's rollout.
+  target pod (valid state: scheduler placed it on the server), skip rather than
+  fail.
+- **`agentNodeWithPod`** — 30 s poll for a Running pod matching a label selector
+  on any agent node; calls `t.Skipf` if not found.
+- **`waitAllReady`** — called at the top of every drain test to ensure workloads
+  have fully converged from the previous test's rollout before starting.
 - **`WaitForPodsOnAgentNodes`** — called after `TestDrain_MultiNode` uncordons
   both agents, to prevent all subsequent tests from silent-skipping because
   pods rescheduled to the server during the dual-agent drain.
-- **`NodeHasActivePodsWithSelector`** — label-filtered version of
-  `NodeHasActivePods`, used by `TestDrain_MultipleWorkloads` to find a node
-  hosting both NATS and Grafana pods.
 
 ### E2E test inventory (18 tests)
 
@@ -257,7 +258,7 @@ so CI can pin a specific k3s release.
 | `TestDrain_DryRun` | No cordon, no annotation change |
 | `TestDrain_NATS` | StatefulSet rolling restart + pod vacate |
 | `TestDrain_Grafana` | Deployment rolling restart + pod vacate |
-| `TestDrain_MultipleWorkloads` | Both NATS + Grafana restarted on shared node |
+| `TestDrain_MultipleWorkloads` | Both NATS + Grafana restarted on a shared node |
 | `TestDrain_Priority` | NATS (priority 200) restarts before Grafana (priority 100) |
 | `TestDrain_SkipWorkload` | `--skip-workload` leaves Grafana untouched |
 | `TestDrain_OnlyWorkload` | `--only-workload` leaves Grafana untouched |
@@ -281,6 +282,22 @@ so CI can pin a specific k3s release.
 | CI job `timeout-minutes` | 40 | `.github/workflows/e2e.yml` |
 | Per-test drain context | 8m (`drainTimeout`) | `e2e/drain_test.go` |
 | Per-workload ready wait | 5m (`workloadReady`) | `e2e/drain_test.go` |
+
+## Release process
+
+```bash
+git tag v0.x.0
+git push origin v0.x.0
+```
+
+This triggers `.github/workflows/release.yml` which:
+1. Runs GoReleaser → builds 5 platform binaries, creates GitHub release
+2. Runs `scripts/update-krew-manifest.py` → rewrites `plugin.yaml`
+3. Uploads `plugin.yaml` to the GitHub release
+4. Runs `scripts/commit-manifest.sh` → commits updated `plugin.yaml` to `main`
+
+Krew-index submission is handled by `scripts/submit-to-krew-index.sh` in a
+separate (currently commented-out) workflow job. See README for setup.
 
 ## Coding conventions
 
