@@ -108,7 +108,7 @@ func HelmUninstall(ctx context.Context, kubeconfigPath, releaseName, namespace s
 // --------------------------------------------------------------------------
 
 // NATSRelease returns the NATS helm release config: a 3-replica cluster
-// (StatefulSet) spread one pod per node with drain priority 200.
+// (StatefulSet) spread one pod per node with drain priority 10.
 func NATSRelease(ns string) HelmRelease {
 	return HelmRelease{
 		ReleaseName: "nats",
@@ -121,8 +121,10 @@ config:
     enabled: true
     replicas: 3
 statefulSet:
-  annotations:
-    kubectl.safed.io/drain-priority: "10"
+  merge:
+    metadata:
+      annotations:
+        kubectl.safed.io/drain-priority: "10"
   topologySpreadConstraints:
     kubernetes.io/hostname:
       maxSkew: 1
