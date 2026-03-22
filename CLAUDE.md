@@ -221,7 +221,7 @@ helm in `$PATH` and are NOT run by `make check` or the CI `test` job.
 
 | Component | Helm chart | Purpose |
 |---|---|---|
-| NATS | `nats/nats` (3 replicas) | StatefulSet rolling restart target; drain priority 200 |
+| NATS | `nats/nats` (3 replicas) | StatefulSet rolling restart target; drain priority 10 (restarts first) |
 | Grafana | `grafana/grafana` (3 replicas) | Deployment rolling restart target; drain priority 100 |
 | kube-state-metrics | `prometheus-community/kube-state-metrics` | Lightweight always-present Deployment |
 

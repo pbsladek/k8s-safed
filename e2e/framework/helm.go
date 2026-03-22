@@ -122,7 +122,7 @@ config:
     replicas: 3
 statefulSet:
   annotations:
-    kubectl.safed.io/drain-priority: "200"
+    kubectl.safed.io/drain-priority: "10"
   topologySpreadConstraints:
     kubernetes.io/hostname:
       maxSkew: 1

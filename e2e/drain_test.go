@@ -295,17 +295,44 @@ func TestDrain_MultipleWorkloads(t *testing.T) {
 // TestDrain_Priority — high-priority NATS before low-priority Grafana
 // --------------------------------------------------------------------------
 
-// TestDrain_Priority runs a sequential drain (--max-concurrency=1) and
-// verifies that NATS (priority 200) receives its restartedAt annotation before
-// Grafana (priority 100) by comparing RFC3339 timestamps.
+// TestDrain_Priority runs a sequential drain (--max-concurrency=1) on a node
+// that has both NATS (priority=10) and Grafana (priority=100), then verifies
+// that NATS received its restartedAt annotation before Grafana by comparing
+// RFC3339 timestamps. Lower priority value = restarts first.
+//
+// The test skips if no agent node currently has both workloads — this is a
+// valid scheduler outcome and the ordering assertion cannot be made without
+// both workloads on the same drained node.
 func TestDrain_Priority(t *testing.T) {
 	waitAllReady(t)
 
-	target := agentNodeWithPod(t, framework.NATSPodSelector)
-	defer uncordon(t, target)
-
 	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 	defer cancel()
+
+	// Need a node hosting both NATS and Grafana so kubectl-safed restarts both
+	// in this single drain, making the timestamp comparison meaningful.
+	agents, err := testCluster.AgentNodeNames(ctx)
+	if err != nil || len(agents) == 0 {
+		t.Skipf("no agent nodes: %v", err)
+	}
+	var target string
+	for _, a := range agents {
+		hasNATS, _ := framework.NodeHasActivePodsWithSelector(ctx, testClient, a, framework.E2ENamespace, framework.NATSPodSelector)
+		hasGrafana, _ := framework.NodeHasActivePodsWithSelector(ctx, testClient, a, framework.E2ENamespace, framework.GrafanaPodSelector)
+		if hasNATS && hasGrafana {
+			target = a
+			break
+		}
+	}
+	if target == "" {
+		t.Skip("no agent node has both NATS and Grafana pods — cannot assert priority ordering")
+	}
+	defer uncordon(t, target)
+
+	// Capture before so we can verify both workloads were actually restarted
+	// by this drain, not carry-over timestamps from previous tests.
+	beforeNATS := getAnnotation(t, "StatefulSet", framework.NATSStatefulSetName)
+	beforeGrafana := getAnnotation(t, "Deployment", framework.GrafanaDeploymentName)
 
 	result := testBinary.Drain(ctx, target,
 		"--rollout-timeout", "5m",
@@ -318,14 +345,19 @@ func TestDrain_Priority(t *testing.T) {
 	natsAnn := getAnnotation(t, "StatefulSet", framework.NATSStatefulSetName)
 	grafanaAnn := getAnnotation(t, "Deployment", framework.GrafanaDeploymentName)
 
-	if natsAnn == "" || grafanaAnn == "" {
-		t.Fatalf("expected both workloads restarted (nats=%q, grafana=%q)", natsAnn, grafanaAnn)
+	if natsAnn == beforeNATS {
+		t.Fatal("NATS annotation did not change — was not restarted by this drain")
+	}
+	if grafanaAnn == beforeGrafana {
+		t.Fatal("Grafana annotation did not change — was not restarted by this drain")
 	}
 
-	// RFC3339 timestamps are lexicographically ordered — NATS must be ≤ Grafana.
+	// RFC3339 timestamps are lexicographically ordered — NATS (priority=10)
+	// must have been restarted before or at the same time as Grafana (priority=100).
 	if natsAnn > grafanaAnn {
-		t.Errorf("priority ordering violated: NATS (priority=200) annotation %q is LATER than "+
-			"Grafana (priority=100) annotation %q", natsAnn, grafanaAnn)
+		t.Errorf("priority ordering violated: NATS (priority=10) annotation %q is LATER than "+
+			"Grafana (priority=100) annotation %q — lower priority value must restart first",
+			natsAnn, grafanaAnn)
 	}
 }
 
@@ -519,59 +551,6 @@ func TestDrain_NodeSelector(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// TestDrain_MultiNode
-// --------------------------------------------------------------------------
-
-func TestDrain_MultiNode(t *testing.T) {
-	waitAllReady(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
-	defer cancel()
-
-	agents, err := testCluster.AgentNodeNames(ctx)
-	if err != nil || len(agents) < 2 {
-		t.Skip("need at least 2 agent nodes for multi-node drain")
-	}
-	for _, a := range agents {
-		defer uncordon(t, a)
-	}
-
-	beforeNATS := getAnnotation(t, "StatefulSet", framework.NATSStatefulSetName)
-
-	result := testBinary.DrainNodes(ctx, agents,
-		"--rollout-timeout", "5m",
-		"--node-concurrency", "2",
-	)
-	if result.Err != nil {
-		t.Fatalf("multi-node drain failed: %v\nstdout: %s\nstderr: %s",
-			result.Err, result.Stdout, result.Stderr)
-	}
-
-	for _, agent := range agents {
-		verifyNodeCordoned(t, agent)
-	}
-
-	assertRestarted(t, "StatefulSet", framework.NATSStatefulSetName, beforeNATS)
-
-	// All workloads must recover (pods reschedule to server node).
-	if err := framework.WaitForCoreWorkloads(ctx, testClient, framework.E2ENamespace, workloadReady); err != nil {
-		t.Fatalf("workloads not healthy after multi-node drain: %v", err)
-	}
-
-	// Uncordon both agents (defers run at end of test, but we need to do it
-	// now so that pods can reschedule back to agent nodes for subsequent tests).
-	for _, a := range agents {
-		uncordon(t, a)
-	}
-	// Wait for at least one NATS pod to return to an agent node so subsequent
-	// tests are not all silently skipped by agentNodeWithPod.
-	if err := framework.WaitForPodsOnAgentNodes(ctx, testClient, agents,
-		framework.E2ENamespace, framework.NATSPodSelector, 1, 3*time.Minute); err != nil {
-		t.Logf("pods slow to return to agent nodes after multi-node uncordon: %v (continuing)", err)
-	}
-}
-
-// --------------------------------------------------------------------------
 // TestDrain_EmitEvents
 // --------------------------------------------------------------------------
 
@@ -691,6 +670,52 @@ func TestDrain_CheckpointResume(t *testing.T) {
 	combined := r2.Stdout + r2.Stderr
 	if strings.Contains(strings.ToLower(combined), "checkpoint error") {
 		t.Errorf("unexpected checkpoint error in output: %s", combined)
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestDrain_MultiNode
+// --------------------------------------------------------------------------
+
+// TestDrain_MultiNode is intentionally placed after all tests that require
+// existing workload pods on agent nodes. Draining both agents moves all pods
+// to the server node; they do not automatically reschedule back after uncordon.
+// Tests that follow create their own fresh pods (PDB, CrashLoop) so they are
+// unaffected by this redistribution.
+func TestDrain_MultiNode(t *testing.T) {
+	waitAllReady(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancel()
+
+	agents, err := testCluster.AgentNodeNames(ctx)
+	if err != nil || len(agents) < 2 {
+		t.Skip("need at least 2 agent nodes for multi-node drain")
+	}
+	for _, a := range agents {
+		defer uncordon(t, a)
+	}
+
+	beforeNATS := getAnnotation(t, "StatefulSet", framework.NATSStatefulSetName)
+
+	result := testBinary.DrainNodes(ctx, agents,
+		"--rollout-timeout", "5m",
+		"--node-concurrency", "2",
+	)
+	if result.Err != nil {
+		t.Fatalf("multi-node drain failed: %v\nstdout: %s\nstderr: %s",
+			result.Err, result.Stdout, result.Stderr)
+	}
+
+	for _, agent := range agents {
+		verifyNodeCordoned(t, agent)
+	}
+
+	assertRestarted(t, "StatefulSet", framework.NATSStatefulSetName, beforeNATS)
+
+	// All workloads must recover (pods reschedule to server node).
+	if err := framework.WaitForCoreWorkloads(ctx, testClient, framework.E2ENamespace, workloadReady); err != nil {
+		t.Fatalf("workloads not healthy after multi-node drain: %v", err)
 	}
 }
 
