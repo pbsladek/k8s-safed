@@ -1,0 +1,95 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [main]
+    tags-ignore:
+      - "v*"
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+  schedule:
+    # Nightly at 03:00 UTC on main
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  K3D_VERSION: v5.8.3
+  K3S_IMAGE: rancher/k3s:v1.33.4-k3s1
+  KUBECTL_VERSION: v1.35.3
+  HELM_VERSION: v3.16.4
+  SAFED_E2E_CLUSTER_NAME: safed-e2e-ci
+
+jobs:
+  e2e:
+    name: E2E (k3d + NATS + Grafana)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install kubectl (pinned)
+        run: |
+          mkdir -p "${HOME}/bin"
+          curl -fsSL -o "${HOME}/bin/kubectl" \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x "${HOME}/bin/kubectl"
+          echo "${HOME}/bin" >> "${GITHUB_PATH}"
+          kubectl version --client
+
+      - name: Install k3d (pinned)
+        run: |
+          mkdir -p "${HOME}/bin"
+          curl -fsSL -o "${HOME}/bin/k3d" \
+            "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-amd64"
+          chmod +x "${HOME}/bin/k3d"
+          echo "${HOME}/bin" >> "${GITHUB_PATH}"
+          k3d version
+
+      - name: Install helm (pinned)
+        run: |
+          mkdir -p "${HOME}/bin"
+          curl -fsSL -o /tmp/helm.tar.gz \
+            "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          tar -xzf /tmp/helm.tar.gz -C /tmp
+          install -m 0755 /tmp/linux-amd64/helm "${HOME}/bin/helm"
+          echo "${HOME}/bin" >> "${GITHUB_PATH}"
+          helm version --short
+
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Run E2E tests
+        run: go test -v -tags=e2e -count=1 -timeout=30m ./e2e/...
+        env:
+          SAFED_E2E_CLUSTER_NAME: ${{ env.SAFED_E2E_CLUSTER_NAME }}
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        continue-on-error: true
+        run: bash hack/ci/collect-diagnostics.sh
+        env:
+          SAFED_E2E_CLUSTER_NAME: ${{ env.SAFED_E2E_CLUSTER_NAME }}
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/safed-e2e-diagnostics
+          if-no-files-found: warn
+          retention-days: 7

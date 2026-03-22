@@ -12,6 +12,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/pbsladek/k8s-safed/pkg/k8s"
+	"github.com/pbsladek/k8s-safed/pkg/workload"
 )
 
 // --------------------------------------------------------------------------
@@ -540,5 +541,165 @@ func TestWaitForStatefulSetRollout_EmptyRevisionNotComplete(t *testing.T) {
 	// Should time out rather than falsely report completion.
 	if err := d.waitForStatefulSetRollout(ctx, "default", "db", 1); err == nil {
 		t.Fatal("expected timeout error for empty revision, got nil")
+	}
+}
+
+// --------------------------------------------------------------------------
+// filterWorkloads
+// --------------------------------------------------------------------------
+
+func makeWorkload(kind workload.Kind, ns, name string) workload.Workload {
+	return workload.Workload{
+		Kind:      kind,
+		Namespace: ns,
+		Name:      name,
+		Selector:  &metav1.LabelSelector{},
+	}
+}
+
+func TestFilterWorkloads_NoFilter_ReturnsAll(t *testing.T) {
+	fakeCS := fake.NewSimpleClientset()
+	d := newTestDrainer(t, "node1", fakeCS)
+
+	wls := []workload.Workload{
+		makeWorkload(workload.KindDeployment, "default", "api"),
+		makeWorkload(workload.KindStatefulSet, "default", "db"),
+	}
+	got := d.filterWorkloads(wls)
+	if len(got) != 2 {
+		t.Errorf("expected 2 workloads with no filter, got %d", len(got))
+	}
+}
+
+func TestFilterWorkloads_SkipWorkload_Removes(t *testing.T) {
+	fakeCS := fake.NewSimpleClientset()
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.SkipWorkloads = map[string]bool{"Deployment/default/api": true}
+	})
+
+	wls := []workload.Workload{
+		makeWorkload(workload.KindDeployment, "default", "api"),
+		makeWorkload(workload.KindStatefulSet, "default", "db"),
+	}
+	got := d.filterWorkloads(wls)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 workload after skip, got %d", len(got))
+	}
+	if got[0].Name != "db" {
+		t.Errorf("expected remaining workload to be 'db', got %q", got[0].Name)
+	}
+}
+
+func TestFilterWorkloads_OnlyWorkload_KeepsOnlyNamed(t *testing.T) {
+	fakeCS := fake.NewSimpleClientset()
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.OnlyWorkloads = map[string]bool{"StatefulSet/default/db": true}
+	})
+
+	wls := []workload.Workload{
+		makeWorkload(workload.KindDeployment, "default", "api"),
+		makeWorkload(workload.KindStatefulSet, "default", "db"),
+		makeWorkload(workload.KindDeployment, "default", "worker"),
+	}
+	got := d.filterWorkloads(wls)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 workload after only filter, got %d", len(got))
+	}
+	if got[0].Name != "db" {
+		t.Errorf("expected 'db', got %q", got[0].Name)
+	}
+}
+
+func TestFilterWorkloads_SkipAll_ReturnsEmpty(t *testing.T) {
+	fakeCS := fake.NewSimpleClientset()
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.SkipWorkloads = map[string]bool{
+			"Deployment/default/api": true,
+			"StatefulSet/default/db": true,
+		}
+	})
+
+	wls := []workload.Workload{
+		makeWorkload(workload.KindDeployment, "default", "api"),
+		makeWorkload(workload.KindStatefulSet, "default", "db"),
+	}
+	got := d.filterWorkloads(wls)
+	if len(got) != 0 {
+		t.Errorf("expected 0 workloads after skipping all, got %d", len(got))
+	}
+}
+
+// --------------------------------------------------------------------------
+// badWaitingReason
+// --------------------------------------------------------------------------
+
+func TestBadWaitingReason_CrashLoopBackOff_WithTermination(t *testing.T) {
+	cs := corev1.ContainerStatus{
+		State: corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+		},
+		LastTerminationState: corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{ExitCode: 1},
+		},
+	}
+	if got := badWaitingReason(cs); got != "CrashLoopBackOff" {
+		t.Errorf("got %q, want CrashLoopBackOff", got)
+	}
+}
+
+func TestBadWaitingReason_CrashLoopBackOff_WithoutTermination_Ignored(t *testing.T) {
+	// First crash: LastTerminationState is not yet set — should not fail fast.
+	cs := corev1.ContainerStatus{
+		State: corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+		},
+		// LastTerminationState is zero value (no Terminated set)
+	}
+	if got := badWaitingReason(cs); got != "" {
+		t.Errorf("expected empty reason before first termination, got %q", got)
+	}
+}
+
+func TestBadWaitingReason_ImagePullBackOff(t *testing.T) {
+	cs := corev1.ContainerStatus{
+		State: corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"},
+		},
+	}
+	if got := badWaitingReason(cs); got != "ImagePullBackOff" {
+		t.Errorf("got %q, want ImagePullBackOff", got)
+	}
+}
+
+func TestBadWaitingReason_ErrImagePull(t *testing.T) {
+	cs := corev1.ContainerStatus{
+		State: corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{Reason: "ErrImagePull"},
+		},
+	}
+	if got := badWaitingReason(cs); got != "ErrImagePull" {
+		t.Errorf("got %q, want ErrImagePull", got)
+	}
+}
+
+func TestBadWaitingReason_ContainerCreating_Ignored(t *testing.T) {
+	cs := corev1.ContainerStatus{
+		State: corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"},
+		},
+	}
+	if got := badWaitingReason(cs); got != "" {
+		t.Errorf("ContainerCreating should not be a bad state, got %q", got)
+	}
+}
+
+func TestBadWaitingReason_NotWaiting_Ignored(t *testing.T) {
+	cs := corev1.ContainerStatus{
+		State: corev1.ContainerState{
+			Running: &corev1.ContainerStateRunning{},
+		},
+	}
+	if got := badWaitingReason(cs); got != "" {
+		t.Errorf("running container should not produce a reason, got %q", got)
 	}
 }
