@@ -149,7 +149,7 @@ func (p *Printer) emit(level, subject, msg string) {
 			"subject": subject,
 			"msg":     msg,
 		}
-		data, _ := json.Marshal(rec)
+		data, _ := json.Marshal(rec) // safe: map contains only string values
 		fmt.Fprintln(p.out, string(data))
 
 	default: // LogFormatPlain

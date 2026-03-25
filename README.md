@@ -1,12 +1,18 @@
 # kubectl-safed
 
-A `kubectl` krew plugin that drains Kubernetes nodes **without causing downtime**.
+[![CI](https://github.com/pbsladek/k8s-safed/actions/workflows/ci.yml/badge.svg)](https://github.com/pbsladek/k8s-safed/actions/workflows/ci.yml)
 
-Instead of evicting pods directly — which can violate PodDisruptionBudgets and
-interrupt traffic — `kubectl-safed` cordons the node and triggers rolling
-restarts on every Deployment and StatefulSet that has pods there. The Kubernetes
-scheduler places replacement pods on healthy nodes before the old ones are
-terminated, giving you a zero-downtime drain.
+A `kubectl` krew plugin for draining Kubernetes nodes using rolling restarts
+rather than direct pod eviction.
+
+Instead of evicting pods — which can violate PodDisruptionBudgets and
+terminate traffic-serving containers before replacements are ready —
+`kubectl-safed` cordons the node and triggers rolling restarts on every
+Deployment and StatefulSet with pods there. The Kubernetes scheduler starts
+replacement pods on healthy nodes as part of the normal rollout process.
+Workloads with sufficient replicas and a `RollingUpdate` strategy will
+typically migrate without interruption; single-replica workloads and those
+using a `Recreate` strategy will still experience downtime.
 
 ---
 
@@ -17,7 +23,7 @@ terminated, giving you a zero-downtime drain.
 2. Discover   – find every Deployment and StatefulSet with pods on the node
                 (Pod → ReplicaSet → Deployment ownership is fully resolved)
 3. Filter     – apply --skip-workload / --only-workload before any cluster changes
-4. Pre-flight – scan discovered workloads for downtime risks: single-replica
+4. Pre-flight – scan discovered workloads for disruption risks: single-replica
                 Deployments, Recreate strategy, stateful services, PDBs with 0
                 disruptions allowed. Use --preflight=strict to abort on any risk,
                 --preflight=off to skip entirely.
@@ -41,12 +47,12 @@ target nodes by label, and `--node-concurrency` to drain several nodes at once.
 
 ---
 
-## Differences from `kubectl drain`
+## Comparison with `kubectl drain`
 
-| | `kubectl drain` | `kubectl-safed drain` |
+| | `kubectl drain` | `kubectl safed drain` |
 |---|---|---|
 | Mechanism | Pod eviction | Rolling restart → natural pod migration |
-| Risk of downtime | High if PDB is misconfigured | Low — scheduler places new pods first |
+| Disruption risk | High if PDB is misconfigured | Lower for multi-replica RollingUpdate workloads; single-replica and Recreate workloads still see downtime |
 | Respects RollingUpdate strategy | No | Yes |
 | PDB awareness | Via eviction API | Via rollout controller |
 | Verifies pods left the node | No | Yes, per workload |
@@ -96,7 +102,7 @@ rules:
 >     verbs: ["create"]
 > ```
 
-### kubectl
+### Versions
 
 - kubectl 1.24+
 - Kubernetes cluster 1.22+
@@ -124,8 +130,8 @@ kubectl krew install safed
 ### Manual installation
 
 Download the binary for your platform from the
-[releases page](https://github.com/pbsladek/k8s-safed/releases/latest), then
-place it somewhere on your `PATH` as `kubectl-safed`:
+[releases page](https://github.com/pbsladek/k8s-safed/releases/latest), place
+it on your `PATH` as `kubectl-safed`:
 
 ```bash
 # macOS ARM64 example
@@ -172,7 +178,7 @@ kubectl safed drain NODE [NODE...] [--selector SELECTOR] [flags]
 
 ```bash
 # Preview what would happen — no changes made
-kubectl safed drain worker-1 -d
+kubectl safed drain worker-1 --dry-run
 
 # Drain with default settings (DaemonSets skipped, pre-flight checks on)
 kubectl safed drain worker-1
@@ -180,13 +186,13 @@ kubectl safed drain worker-1
 # Drain multiple nodes sequentially
 kubectl safed drain worker-1 worker-2 worker-3
 
-# Drain all nodes in a node pool (resolved via label selector)
+# Drain all nodes matching a label selector
 kubectl safed drain --selector node-pool=spot
 
 # Drain two nodes in parallel
 kubectl safed drain worker-1 worker-2 --node-concurrency=2
 
-# Abort if any downtime risk is detected during pre-flight
+# Abort if any disruption risk is detected during pre-flight
 kubectl safed drain worker-1 --preflight=strict
 
 # Skip pre-flight checks entirely
@@ -196,12 +202,12 @@ kubectl safed drain worker-1 --preflight=off
 kubectl safed drain worker-1 --rollout-timeout=10m
 
 # Drain with a hard overall deadline
-kubectl safed drain worker-1 -t 30m
+kubectl safed drain worker-1 --timeout=30m
 
 # Restart 3 workloads at a time instead of sequentially
 kubectl safed drain worker-1 --max-concurrency=3
 
-# Restart all workloads at the same time
+# Restart all workloads concurrently
 kubectl safed drain worker-1 --max-concurrency=0
 
 # Drain a node and also evict DaemonSet pods
@@ -211,13 +217,13 @@ kubectl safed drain worker-1 --ignore-daemonsets=false
 kubectl safed drain worker-1 --delete-emptydir-data
 
 # Drain and evict standalone and Job-owned pods
-kubectl safed drain worker-1 -f
+kubectl safed drain worker-1 --force
 
-# Instantly remove standalone pods (no graceful shutdown)
+# Instantly remove standalone pods (bypasses graceful shutdown)
 kubectl safed drain worker-1 --force-delete-standalone
 
 # Output structured JSON logs for ingestion by Loki / Datadog / ELK
-kubectl safed drain worker-1 -o json
+kubectl safed drain worker-1 --log-format=json
 
 # Uncordon the node automatically if the drain fails
 kubectl safed drain worker-1 --uncordon-on-failure
@@ -226,7 +232,9 @@ kubectl safed drain worker-1 --uncordon-on-failure
 kubectl safed drain worker-1 --skip-workload=Deployment/default/batch-processor
 
 # Drain only specific workloads, leave the rest untouched
-kubectl safed drain worker-1 --only-workload=Deployment/default/api --only-workload=StatefulSet/data/postgres
+kubectl safed drain worker-1 \
+  --only-workload=Deployment/default/api \
+  --only-workload=StatefulSet/data/postgres
 
 # Resume a previously interrupted drain (skips already-completed workloads)
 kubectl safed drain worker-1 --resume
@@ -248,47 +256,49 @@ kubectl safed drain worker-1 --context=prod-cluster
 | Flag | Short | Default | Description |
 |---|---|---|---|
 | `--selector` | `-l` | | Label selector to target nodes (e.g. `node-pool=spot`). Mutually exclusive with positional node names. |
-| `--node-concurrency` | | `1` | Number of nodes to drain in parallel (`1` = sequential). Use with care on production clusters. |
+| `--node-concurrency` | | `1` | Number of nodes to drain in parallel. `1` = sequential. |
 
 #### Core behaviour
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
-| `--dry-run` | `-d` | `false` | Preview all actions without making any changes |
-| `--preflight` | | `warn` | Pre-flight mode: `warn` (log risks, continue), `strict` (abort on any risk), `off` (skip all checks) |
-| `--force` | `-f` | `false` | Evict standalone pods (no owner) and Job-owned pods |
-| `--force-delete-standalone` | | `false` | Force-delete standalone pods with `gracePeriodSeconds=0` instead of evicting; implies `--force` |
-| `--ignore-daemonsets` | | `true` | Skip eviction of DaemonSet-managed pods |
-| `--delete-emptydir-data` | | `false` | Allow eviction of pods using emptyDir volumes (data loss) |
-| `--grace-period` | | `-1` | Pod termination grace period in seconds; `-1` uses the pod's own default |
-| `--max-concurrency` | | `1` | `1` = sequential, `0` = all at once, `N` = batches of N (per node, for workloads) |
-| `--uncordon-on-failure` | | `false` | Uncordon the node if the drain fails (only if this run cordoned it) |
+| `--dry-run` | `-d` | `false` | Preview all actions without making any changes. |
+| `--preflight` | | `warn` | Pre-flight mode: `warn` (log risks, continue), `strict` (abort on any risk), `off` (skip all checks). |
+| `--force` | `-f` | `false` | Evict standalone pods (no owner) and Job-owned pods. |
+| `--force-delete-standalone` | | `false` | Force-delete standalone pods with `gracePeriodSeconds=0` instead of evicting. Implies `--force`. |
+| `--ignore-daemonsets` | | `true` | Skip eviction of DaemonSet-managed pods. |
+| `--delete-emptydir-data` | | `false` | Allow eviction of pods using emptyDir volumes (data loss). |
+| `--grace-period` | | `-1` | Pod termination grace period in seconds. `-1` uses the pod's own default. |
+| `--max-concurrency` | | `1` | Number of workload rolling-restarts to run concurrently per node. `1` = sequential, `0` = all at once, `N` = batches of N. |
+| `--uncordon-on-failure` | | `false` | Uncordon the node if the drain fails. Only applies when this run performed the cordon. |
 | `--skip-workload` | | | Exclude a workload from rolling restarts (`Kind/namespace/name`). Repeatable. Mutually exclusive with `--only-workload`. |
 | `--only-workload` | | | Restrict rolling restarts to these workloads only (`Kind/namespace/name`). Repeatable. Mutually exclusive with `--skip-workload`. |
-| `--emit-events` | | `false` | Emit Kubernetes Events to node and workload objects (requires `events/create` RBAC; visible via `kubectl describe`) |
-| `--resume` | | `false` | Resume an interrupted drain, skipping workloads already recorded in the checkpoint file |
-| `--checkpoint-path` | | | Override the checkpoint file path (default: `~/.kube/safed-checkpoints/<context>-<node>.json`) |
-| `--profile` | | | Load flag defaults from a named profile in `~/.kube/safed.yaml` (see [Drain profiles](#drain-profiles)) |
-| `--config` | | | Path to the safed config file (default: `~/.kube/safed.yaml`; env: `KUBECTL_SAFED_CONFIG`) |
+| `--emit-events` | | `false` | Emit Kubernetes Events to node and workload objects. Requires `events/create` RBAC. Visible via `kubectl describe`. |
+| `--resume` | | `false` | Resume an interrupted drain, skipping workloads already recorded in the checkpoint file. |
+| `--checkpoint-path` | | | Override the checkpoint file path. Default: `~/.kube/safed-checkpoints/<context>-<node>.json`. |
+| `--profile` | | | Load flag defaults from a named profile in the safed config file. CLI flags override profile values. |
+| `--config` | | | Path to the safed config file. Default: `~/.kube/safed.yaml`. Env: `KUBECTL_SAFED_CONFIG`. |
 
 #### Timeouts
 
-| Flag | Short | Default | Description |
-|---|---|---|---|
-| `--timeout` | `-t` | `0` | Overall drain deadline per node; `0` = no limit |
-| `--rollout-timeout` | | `5m` | Per-workload time to wait for rolling restart to converge; `0` = no per-workload limit |
-| `--pod-vacate-timeout` | | `2m` | Per-workload time to wait for pods to leave the node after rollout |
-| `--eviction-timeout` | | `5m` | Per-pod time to wait for a PDB-blocked eviction to succeed |
-| `--pdb-retry-interval` | | `5s` | Base retry interval when eviction is blocked by a PDB (doubles each attempt, capped at 60s) |
-| `--poll-interval` | | `5s` | Interval between status checks in all wait loops |
+| Flag | Default | Description |
+|---|---|---|
+| `--timeout` | `0` (none) | Overall drain deadline per node. `0` = no limit. |
+| `--rollout-timeout` | `5m` | Per-workload time to wait for a rolling restart to converge. `0` = no per-workload limit. |
+| `--pod-vacate-timeout` | `2m` | Per-workload time to wait for pods to leave the node after rollout. |
+| `--eviction-timeout` | `5m` | Per-pod time to wait for a PDB-blocked eviction to succeed. |
+| `--pdb-retry-interval` | `5s` | Base retry interval when eviction is blocked by a PDB. Doubles each attempt, capped at 60s. |
+| `--poll-interval` | `5s` | Interval between status checks in all wait loops. |
 
 #### Output
 
 | Flag | Short | Default | Description |
 |---|---|---|---|
-| `--log-format` | `-o` | `plain` | `plain` (human-readable, aligned columns) or `json` (one object per line) |
+| `--log-format` | `-o` | `plain` | `plain` (human-readable, aligned columns) or `json` (one object per line). |
 
-### Global flags (standard kubectl flags)
+### Global flags
+
+All standard `kubectl` flags are supported:
 
 ```
 --kubeconfig, --context, --namespace, --server, --token,
@@ -299,8 +309,8 @@ kubectl safed drain worker-1 --context=prod-cluster
 
 ## Pre-flight checks
 
-Before making any cluster changes (before the cordon), `kubectl-safed` scans
-the discovered workloads and surfaces potential issues:
+Before making any cluster changes, `kubectl-safed` scans the discovered
+workloads and surfaces potential issues:
 
 | Check | Risk level | Condition |
 |---|---|---|
@@ -311,15 +321,15 @@ the discovered workloads and surfaces potential issues:
 | Known stateful service | note | Name matches a known stateful pattern (see below) |
 | PDB with 0 disruptions | note | `status.disruptionsAllowed == 0` — eviction of remaining pods may be blocked |
 
-**Risk-level** findings cause a non-zero exit under `--preflight=strict` and are
-prefixed with `RISK:` in the log. Informational findings are prefixed with
-`note:` and never abort the drain.
+**Risk-level** findings are prefixed with `RISK:` in the log. Under
+`--preflight=strict` they cause a non-zero exit before the node is cordoned.
+Informational findings are prefixed with `note:` and never abort the drain.
 
 ```
 [safed] 15:04:05  worker-1                          info    Running pre-flight checks...
-[safed] 15:04:05  Deployment/default/api            warn    RISK: single replica — rolling restart will briefly have 0 ready pods (downtime risk)
-[safed] 15:04:05  StatefulSet/data/postgres         warn    note: detected known stateful service ("postgres") — verify replication health and data consistency before draining
-[safed] 15:04:05  PodDisruptionBudget/data/my-pdb   warn    note: 0 disruptions currently allowed — eviction of remaining pods may be blocked until the PDB permits it
+[safed] 15:04:05  Deployment/default/api            warn    RISK: single replica — rolling restart will briefly have 0 ready pods
+[safed] 15:04:05  StatefulSet/data/postgres         warn    note: detected known stateful service ("postgres") — verify replication health before draining
+[safed] 15:04:05  PodDisruptionBudget/data/my-pdb   warn    note: 0 disruptions currently allowed — eviction of remaining pods may be blocked
 ```
 
 Stateful service detection matches these patterns (case-insensitive substring):
@@ -334,9 +344,6 @@ Stateful service detection matches these patterns (case-insensitive substring):
 `etcd`, `cassandra`, `scylla`, `cockroach`, `clickhouse`, `yugabyte`,
 `minio`, `vault`, `memcached`
 
-Use `--preflight=strict` to abort the drain when any risk-level finding is
-detected. Use `--preflight=off` to skip all checks.
-
 ---
 
 ## Log output
@@ -347,7 +354,7 @@ detected. Use `--preflight=off` to skip all checks.
 [safed] 15:04:05  worker-1                          info    Validating "worker-1"
 [safed] 15:04:05  worker-1                          info    Discovering managed workloads...
 [safed] 15:04:05  worker-1                          info    Running pre-flight checks...
-[safed] 15:04:05  Deployment/default/api            warn    RISK: single replica — rolling restart will briefly have 0 ready pods (downtime risk)
+[safed] 15:04:05  Deployment/default/api            warn    RISK: single replica — rolling restart will briefly have 0 ready pods
 [safed] 15:04:05  worker-1                          info    Cordoning "worker-1"...
 [safed] 15:04:05  worker-1                          done    Cordoned "worker-1"
 [safed] 15:04:06  Deployment/default/api            start   Rolling restart [1/3]
@@ -358,6 +365,7 @@ detected. Use `--preflight=off` to skip all checks.
 ```
 
 Useful grep patterns:
+
 ```bash
 grep "start"                   # all workloads that began restarting
 grep "done"                    # all completions
@@ -373,7 +381,7 @@ grep "worker-1"                # all events for a specific node (useful in multi
 
 ```json
 {"ts":"2026-03-15T15:04:05Z","level":"info","subject":"worker-1","msg":"Validating \"worker-1\""}
-{"ts":"2026-03-15T15:04:05Z","level":"warn","subject":"Deployment/default/api","msg":"RISK: single replica — rolling restart will briefly have 0 ready pods (downtime risk)"}
+{"ts":"2026-03-15T15:04:05Z","level":"warn","subject":"Deployment/default/api","msg":"RISK: single replica — rolling restart will briefly have 0 ready pods"}
 {"ts":"2026-03-15T15:04:06Z","level":"start","subject":"Deployment/default/api","msg":"Rolling restart [1/3]"}
 {"ts":"2026-03-15T15:04:11Z","level":"poll","subject":"Deployment/default/api","msg":"rollout updated=2/3 ready=1/3 available=1/3 unavail=1"}
 {"ts":"2026-03-15T15:04:16Z","level":"done","subject":"Deployment/default/api","msg":"Complete (10s)"}
@@ -385,13 +393,13 @@ Level values: `info`, `start`, `done`, `poll`, `dryrun`, `warn`
 
 ## What gets skipped
 
-By default the following pods are **never** evicted or restarted:
+By default the following pods are never evicted or restarted:
 
 | Pod type | Reason |
 |---|---|
 | Mirror pods (static pods) | Managed directly by kubelet; cannot be evicted via API |
 | `Succeeded` / `Failed` pods | Already terminal; nothing to do |
-| Already-terminating pods | `DeletionTimestamp` is set; kubelet is cleaning them up |
+| Already-terminating pods | `DeletionTimestamp` is set; kubelet handles cleanup |
 | DaemonSet pods | Run on every node by design (override with `--ignore-daemonsets=false`) |
 | Pods with `emptyDir` | Eviction causes data loss (override with `--delete-emptydir-data`) |
 | Standalone pods | No owner reference; require `--force` |
@@ -399,69 +407,46 @@ By default the following pods are **never** evicted or restarted:
 
 ---
 
-## Edge case handling
-
-### PodDisruptionBudget blocking eviction
-
-When eviction of a remaining pod is blocked by a PDB (HTTP 429), the drain
-retries with exponential backoff instead of failing immediately. Each blocked
-attempt is logged:
-
-```
-[safed] 15:04:30  Pod/default/my-pod             poll    eviction blocked by PodDisruptionBudget (attempt 2), retrying in 10s
-```
-
-Retries continue until `--eviction-timeout` expires (default 5m). Tune with
-`--pdb-retry-interval` (base backoff, doubles each attempt, cap 60s).
-
-### CrashLoopBackOff / ImagePullBackOff during rollout
-
-The rollout waiter actively inspects pod container states on every poll. If a
-pod enters `CrashLoopBackOff` (after its first exit) or `ImagePullBackOff` /
-`ErrImagePull`, the drain fails immediately with a clear error instead of
-silently waiting for `--rollout-timeout` to expire.
-
-This is especially important for StatefulSets, which have no
-`ProgressDeadlineExceeded` equivalent.
-
-### Standalone pods
-
-With `--force`, standalone pods (no owner references) are evicted via the
-eviction API. With `--force-delete-standalone`, they are immediately deleted
-with `gracePeriodSeconds=0`, bypassing both PDB checks and graceful shutdown
-hooks. Use this when you need them gone immediately and their shutdown behaviour
-does not matter.
-
----
-
 ## Drain priority
 
-By default workloads are restarted in discovery order. Add the
+Workloads are processed in the order they are discovered by default. Add the
 `kubectl.safed.io/drain-priority` annotation to control the sequence: lower
-values restart first. Workloads without the annotation use a default priority
-of `100`.
+values are restarted first. Workloads without the annotation use a default
+priority of `100`.
 
 ```yaml
-# Restart the frontend first (priority 10), then the API (default 100),
-# then the database last (priority 200).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: frontend
   annotations:
-    kubectl.safed.io/drain-priority: "10"
+    kubectl.safed.io/drain-priority: "10"   # restarts first
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  # no annotation — uses default priority 100
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: database
+  annotations:
+    kubectl.safed.io/drain-priority: "200"  # restarts last
 ```
 
-Within the same priority level, `--max-concurrency` still applies, so you can
-run same-priority workloads concurrently while keeping critical tiers strictly
-ordered.
+Within the same priority level, `--max-concurrency` still applies, so
+same-priority workloads can run concurrently while critical tiers remain
+strictly ordered.
 
 ---
 
 ## Workload filtering
 
 `--skip-workload` and `--only-workload` accept `Kind/namespace/name` — the
-same format used in the drain log output, so you can copy-paste directly.
+same format used in log output, so values can be copied directly from a
+previous drain run.
 
 ```bash
 # Skip one long-running batch job, drain everything else normally
@@ -474,18 +459,17 @@ kubectl safed drain worker-1 \
 ```
 
 Skipped workloads are not rolling-restarted but still fall through to the
-conventional eviction phase, so DaemonSet pods and standalones are handled
-normally.
+eviction phase, so DaemonSet pods and standalones are handled normally.
 
 ---
 
-## Checkpoint & resume
+## Checkpoint and resume
 
-When a drain is interrupted — by a timeout, a network blip, or Ctrl-C —
+When a drain is interrupted — by a timeout, a network error, or Ctrl-C —
 `--resume` picks up where the previous run left off:
 
 ```bash
-# First attempt (interrupted after worker-1's api Deployment completed)
+# First attempt (interrupted after the api Deployment completed)
 kubectl safed drain worker-1
 
 # Resume: skips api, continues from the next workload
@@ -493,22 +477,21 @@ kubectl safed drain worker-1 --resume
 ```
 
 Progress is written to `~/.kube/safed-checkpoints/<context>-<node>.json` after
-each workload completes. The checkpoint is automatically deleted on a successful
-drain. On failure it is left in place for the next `--resume` attempt.
+each workload completes. The file is deleted automatically on a successful
+drain. On failure it is left in place for the next `--resume` run.
 
-For multi-node drains each node has its own checkpoint file, so resuming
-applies independently per node.
+In multi-node drains, each node has its own checkpoint file so resuming applies
+independently per node.
 
-Override the file path with `--checkpoint-path` if needed (e.g. for scripting
-or when the home directory is not writable).
+Override the path with `--checkpoint-path` when needed (e.g. for scripted
+automation or when the home directory is not writable).
 
 ---
 
 ## Drain profiles
 
 Save common flag combinations in `~/.kube/safed.yaml` and reference them with
-`--profile`. This avoids retyping the same flags and reduces the chance of
-operator error during maintenance windows.
+`--profile`. CLI flags always override profile values.
 
 ```yaml
 profiles:
@@ -530,19 +513,56 @@ profiles:
 ```
 
 ```bash
+# Use the prod profile
 kubectl safed drain worker-1 --profile=prod
-```
 
-CLI flags always override profile values, so you can use a profile as a
-baseline and override specific settings for a one-off:
-
-```bash
-# Use prod profile but allow 3 concurrent workloads for this one drain
+# Use the prod profile but override one setting
 kubectl safed drain worker-1 --profile=prod --max-concurrency=3
 ```
 
 The config file path can be overridden with `--config` or the
 `KUBECTL_SAFED_CONFIG` environment variable.
+
+---
+
+## Edge cases
+
+### PodDisruptionBudget blocking eviction
+
+When eviction of a remaining pod is blocked by a PDB (HTTP 429), the drain
+retries with exponential backoff rather than failing immediately:
+
+```
+[safed] 15:04:30  Pod/default/my-pod   poll    eviction blocked by PodDisruptionBudget (attempt 2), retrying in 10s
+```
+
+Retries continue until `--eviction-timeout` expires (default 5m). The base
+interval is controlled by `--pdb-retry-interval` (doubles each attempt, capped
+at 60s).
+
+### CrashLoopBackOff and image pull failures
+
+The rollout waiter inspects pod container states on every poll tick. If a pod
+enters `CrashLoopBackOff` (after its first exit), `ImagePullBackOff`, or
+`ErrImagePull`, the drain fails immediately with a descriptive error rather
+than waiting for `--rollout-timeout` to expire.
+
+This is particularly important for StatefulSets, which have no
+`ProgressDeadlineExceeded` equivalent.
+
+### Standalone pods
+
+With `--force`, standalone pods (no owner references) are evicted through the
+eviction API and subject to PDB retry logic. With `--force-delete-standalone`,
+they are deleted immediately with `gracePeriodSeconds=0`, bypassing both PDB
+checks and graceful shutdown. Use this only when the pod's shutdown behaviour
+is not relevant.
+
+### Uncordon on failure
+
+With `--uncordon-on-failure`, the node is automatically uncordoned if the drain
+fails. This only applies when the current run performed the cordon — nodes that
+were already unschedulable before the drain started are not modified.
 
 ---
 
@@ -557,12 +577,12 @@ make test-v  # verbose unit tests
 
 ### End-to-end tests
 
-E2E tests run the compiled `kubectl-safed` binary against a real multi-node
+E2E tests run the compiled `kubectl-safed` binary against a real three-node
 Kubernetes cluster created with [k3d](https://k3d.io). They require `k3d` and
-`helm` in your `$PATH`.
+`helm` in `$PATH`.
 
 ```bash
-# Run the full suite (creates a 3-node k3d cluster, installs NATS + Grafana via Helm)
+# Run the full suite (creates a k3d cluster, installs NATS + Grafana via Helm)
 make e2e
 
 # Run a single test
@@ -572,15 +592,14 @@ make e2e-run TEST=TestDrain_NATS
 The suite covers 18 scenarios including StatefulSet and Deployment rolling
 restarts, multi-node drains, pre-flight checks, priority ordering, PDB-blocked
 eviction, CrashLoopBackOff fail-fast, `--uncordon-on-failure`, workload
-filtering, checkpoint/resume, and Kubernetes Event emission.
+filtering, checkpoint and resume, and Kubernetes Event emission.
 
-E2E tests also run automatically in CI on every push and pull request to `main`,
-nightly at 03:00 UTC, and on `workflow_dispatch` via
-`.github/workflows/e2e.yml`.
+E2E tests run automatically in CI on every push and pull request to `main`,
+nightly at 03:00 UTC, and on `workflow_dispatch`.
 
 ---
 
-## Releasing a new version
+## Releasing
 
 Tag a commit and push — the release workflow handles the rest:
 
@@ -590,74 +609,52 @@ git push origin v0.2.0
 ```
 
 The workflow will:
-1. Build binaries for all platforms
+1. Build binaries for all platforms via GoReleaser
 2. Create a GitHub release with archives and `checksums.txt`
 3. Generate and upload an updated `plugin.yaml` krew manifest
 4. Commit the updated `plugin.yaml` back to `main`
 
 ---
 
-## Publishing to the official krew index
+## Publishing to the krew index
 
-Once the plugin is working and you want it discoverable via
-`kubectl krew install safed`, follow these steps to enable automated
-krew-index PRs on every release.
+Once the plugin is ready for public discovery via `kubectl krew install safed`,
+follow these steps to enable automated krew-index PRs on every release.
 
 ### One-time setup
 
 **1. Fork krew-index**
 
 Go to https://github.com/kubernetes-sigs/krew-index and click **Fork**.
-Keep the default name (`krew-index`) under your account.
 
 **2. Create a Personal Access Token**
 
-Go to **GitHub → Settings → Developer settings → Personal access tokens**
-and create a token (fine-grained or classic) with the **`repo`** scope
-targeting your fork.
+Go to **GitHub → Settings → Developer settings → Personal access tokens** and
+create a token with the **`repo`** scope targeting your fork.
 
-**3. Add the token as a repository secret**
+**3. Add repository secret and variable**
 
-In this repository go to **Settings → Secrets and variables → Actions → Secrets**
-and add:
+In this repository, go to **Settings → Secrets and variables → Actions** and add:
 
-| Name | Value |
-|---|---|
-| `KREW_INDEX_PR_TOKEN` | The PAT you created above |
+| Type | Name | Value |
+|---|---|---|
+| Secret | `KREW_INDEX_PR_TOKEN` | The PAT created above |
+| Variable | `KREW_INDEX_FORK` | `<your-github-username>/krew-index` |
 
-**4. Add your fork slug as a repository variable**
+**4. Uncomment the job in the release workflow**
 
-In **Settings → Secrets and variables → Actions → Variables** add:
+In `.github/workflows/release.yml`, uncomment the `submit-to-krew-index` job.
 
-| Name | Value |
-|---|---|
-| `KREW_INDEX_FORK` | `<your-github-username>/krew-index` |
+### What happens on each release
 
-**5. Uncomment the job in the release workflow**
-
-In `.github/workflows/release.yml`, uncomment the `submit-to-krew-index`
-job (the block starting with `# submit-to-krew-index:`).
-
-### What happens on every release
-
-The `submit-to-krew-index` job runs `scripts/submit-to-krew-index.sh` which:
+The job runs `scripts/submit-to-krew-index.sh` which:
 
 1. Clones your krew-index fork and rebases it against upstream `master`
 2. Copies the updated `plugin.yaml` to `plugins/safed.yaml` on a new branch
-3. Pushes the branch to your fork
-4. Opens a PR against `kubernetes-sigs/krew-index:master`
+3. Pushes the branch and opens a PR against `kubernetes-sigs/krew-index:master`
 
-The krew maintainers review and merge the PR. After merge,
-`kubectl krew install safed` works for everyone.
-
-### Testing the script locally
-
-```bash
-KREW_GITHUB_TOKEN=<pat> \
-KREW_INDEX_FORK=<your-username>/krew-index \
-VERSION=v0.1.0 \
-bash scripts/submit-to-krew-index.sh
-```
+After the krew maintainers merge the PR, `kubectl krew install safed` works
+for everyone.
 
 ---
 
