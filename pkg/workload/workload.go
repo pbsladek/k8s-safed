@@ -8,6 +8,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
@@ -167,6 +168,11 @@ func (f *Finder) resolveReplicaSet(ctx context.Context, namespace, rsName string
 	if !ok {
 		var err error
 		rs, err = f.client.AppsV1().ReplicaSets(namespace).Get(ctx, rsName, metav1.GetOptions{})
+		if k8serrors.IsNotFound(err) {
+			// RS was deleted between the pod LIST and this GET (terminating pod
+			// from a previous rollout). Treat as orphaned — skip.
+			return Workload{}, false, nil
+		}
 		if err != nil {
 			return Workload{}, false, fmt.Errorf("getting ReplicaSet %s/%s: %w", namespace, rsName, err)
 		}
@@ -192,6 +198,9 @@ func (f *Finder) resolveDeployment(ctx context.Context, namespace, name string) 
 	}
 
 	dep, err := f.client.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+	if k8serrors.IsNotFound(err) {
+		return Workload{}, false, nil
+	}
 	if err != nil {
 		return Workload{}, false, fmt.Errorf("getting Deployment %s/%s: %w", namespace, name, err)
 	}
@@ -216,6 +225,9 @@ func (f *Finder) resolveStatefulSet(ctx context.Context, namespace, name string)
 	}
 
 	sts, err := f.client.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+	if k8serrors.IsNotFound(err) {
+		return Workload{}, false, nil
+	}
 	if err != nil {
 		return Workload{}, false, fmt.Errorf("getting StatefulSet %s/%s: %w", namespace, name, err)
 	}
