@@ -6,7 +6,7 @@ LDFLAGS    := -s -w
 # Respect GOBIN / PATH install location; default to /usr/local/bin.
 INSTALL_DIR ?= /usr/local/bin
 
-.PHONY: all build test vet lint fmt check install clean snapshot help e2e e2e-run
+.PHONY: all build test vet lint fmt check install clean release snapshot help e2e e2e-run
 
 all: check build ## Run checks then build (default)
 
@@ -55,6 +55,11 @@ tidy: ## Tidy go.mod and go.sum
 	go mod tidy
 
 ## ── Release ──────────────────────────────────────────────────────────────────
+
+release: ## Tag and push a release: make release VERSION=v0.x.0
+	@test -n "$(VERSION)" || (echo "Usage: make release VERSION=v0.x.0" && exit 1)
+	git tag "$(VERSION)"
+	git push origin "$(VERSION)"
 
 snapshot: ## Build a local multi-arch snapshot via GoReleaser (no publish)
 	goreleaser release --snapshot --clean
