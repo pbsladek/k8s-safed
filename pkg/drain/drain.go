@@ -1,3 +1,4 @@
+// Package drain implements safe Kubernetes node draining via rolling restarts.
 package drain
 
 import (
@@ -187,8 +188,12 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 
 	// Step 1: Validate node.
 	out.Infof(d.opts.NodeName, "Validating %q", d.opts.NodeName)
-	node, err := d.client.CoreV1().Nodes().Get(ctx, d.opts.NodeName, metav1.GetOptions{})
-	if err != nil {
+	var node *corev1.Node
+	if err := retryTransient(ctx, d.pollInterval(), func() error {
+		var e error
+		node, e = d.client.CoreV1().Nodes().Get(ctx, d.opts.NodeName, metav1.GetOptions{})
+		return e
+	}); err != nil {
 		return fmt.Errorf("node %q not found: %w", d.opts.NodeName, err)
 	}
 	out.Infof(d.opts.NodeName, "Found · kernel=%s ready=%v",
@@ -197,8 +202,12 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 	// Step 2: Discover workloads — before any cluster changes so pre-flight
 	// can see the full picture and the operator can abort without side effects.
 	out.Info(d.opts.NodeName, "Discovering managed workloads...")
-	workloads, err := d.finder.FindForNode(ctx, d.opts.NodeName)
-	if err != nil {
+	var workloads []workload.Workload
+	if err := retryTransient(ctx, d.pollInterval(), func() error {
+		var e error
+		workloads, e = d.finder.FindForNode(ctx, d.opts.NodeName)
+		return e
+	}); err != nil {
 		return fmt.Errorf("discovering workloads: %w", err)
 	}
 
@@ -512,7 +521,7 @@ func (d *Drainer) rollingRestart(ctx context.Context, w workload.Workload) error
 			return err
 		}
 		if err := d.waitForDeploymentRollout(ctx, w.Namespace, w.Name, preGen); err != nil {
-			return fmt.Errorf("Deployment %s/%s rollout failed: %w", w.Namespace, w.Name, err)
+			return fmt.Errorf("deployment %s/%s rollout failed: %w", w.Namespace, w.Name, err)
 		}
 
 	case workload.KindStatefulSet:
@@ -995,6 +1004,26 @@ func isTransientAPIError(err error) bool {
 		k8serrors.IsTooManyRequests(err)
 }
 
+// retryTransient calls fn up to 3 times, retrying after interval when the
+// returned error is a transient Kubernetes API error. The first non-transient
+// error is returned immediately. Context cancellation stops the retry loop.
+func retryTransient(ctx context.Context, interval time.Duration, fn func() error) error {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		lastErr = fn()
+		if lastErr == nil || !isTransientAPIError(lastErr) {
+			return lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return lastErr
+		case <-time.After(interval):
+		}
+	}
+	return lastErr
+}
+
 // buildLabelSelectorString converts a *metav1.LabelSelector to the string form
 // accepted by ListOptions.LabelSelector.
 func buildLabelSelectorString(sel *metav1.LabelSelector) (string, error) {
@@ -1185,7 +1214,7 @@ func isJobPod(pod *corev1.Pod) bool {
 
 func hasEmptyDir(pod *corev1.Pod) bool {
 	for _, v := range pod.Spec.Volumes {
-		if v.VolumeSource.EmptyDir != nil {
+		if v.EmptyDir != nil {
 			return true
 		}
 	}

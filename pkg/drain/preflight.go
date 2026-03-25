@@ -82,6 +82,9 @@ func (d *Drainer) runPreflight(ctx context.Context, workloads []workload.Workloa
 		switch w.Kind {
 		case workload.KindDeployment:
 			if depIssues, err := d.preflightDeployment(ctx, w, wsubj); err != nil {
+				if d.opts.Preflight == PreflightModeStrict {
+					return fmt.Errorf("pre-flight: could not inspect Deployment %s: %w", wsubj, err)
+				}
 				out.Warnf(wsubj, "pre-flight: could not inspect Deployment: %v", err)
 			} else {
 				issues = append(issues, depIssues...)
@@ -89,6 +92,9 @@ func (d *Drainer) runPreflight(ctx context.Context, workloads []workload.Workloa
 
 		case workload.KindStatefulSet:
 			if stsIssues, err := d.preflightStatefulSet(ctx, w, wsubj); err != nil {
+				if d.opts.Preflight == PreflightModeStrict {
+					return fmt.Errorf("pre-flight: could not inspect StatefulSet %s: %w", wsubj, err)
+				}
 				out.Warnf(wsubj, "pre-flight: could not inspect StatefulSet: %v", err)
 			} else {
 				issues = append(issues, stsIssues...)

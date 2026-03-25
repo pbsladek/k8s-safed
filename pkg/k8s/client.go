@@ -1,3 +1,4 @@
+// Package k8s provides helpers for constructing Kubernetes clients.
 package k8s
 
 import (

@@ -78,7 +78,7 @@ func makeDeploymentForPreflight(ns, name string, replicas int32, strategy appsv1
 
 func TestPreflightDeployment_SingleReplica_IsRisk(t *testing.T) {
 	dep := makeDeploymentForPreflight("default", "api", 1, appsv1.RollingUpdateDeploymentStrategyType)
-	fakeCS := fake.NewSimpleClientset(&dep)
+	fakeCS := fake.NewClientset(&dep)
 	d := newTestDrainer(t, "node1", fakeCS)
 
 	w := workload.Workload{Kind: workload.KindDeployment, Namespace: "default", Name: "api"}
@@ -96,7 +96,7 @@ func TestPreflightDeployment_SingleReplica_IsRisk(t *testing.T) {
 
 func TestPreflightDeployment_MultiReplica_NoRisk(t *testing.T) {
 	dep := makeDeploymentForPreflight("default", "api", 3, appsv1.RollingUpdateDeploymentStrategyType)
-	fakeCS := fake.NewSimpleClientset(&dep)
+	fakeCS := fake.NewClientset(&dep)
 	d := newTestDrainer(t, "node1", fakeCS)
 
 	w := workload.Workload{Kind: workload.KindDeployment, Namespace: "default", Name: "api"}
@@ -113,7 +113,7 @@ func TestPreflightDeployment_MultiReplica_NoRisk(t *testing.T) {
 
 func TestPreflightDeployment_RecreateStrategy_IsRisk(t *testing.T) {
 	dep := makeDeploymentForPreflight("default", "api", 3, appsv1.RecreateDeploymentStrategyType)
-	fakeCS := fake.NewSimpleClientset(&dep)
+	fakeCS := fake.NewClientset(&dep)
 	d := newTestDrainer(t, "node1", fakeCS)
 
 	w := workload.Workload{Kind: workload.KindDeployment, Namespace: "default", Name: "api"}
@@ -134,7 +134,7 @@ func TestPreflightDeployment_RecreateStrategy_IsRisk(t *testing.T) {
 
 func TestPreflightDeployment_SingleReplicaAndRecreate_TwoRisks(t *testing.T) {
 	dep := makeDeploymentForPreflight("default", "api", 1, appsv1.RecreateDeploymentStrategyType)
-	fakeCS := fake.NewSimpleClientset(&dep)
+	fakeCS := fake.NewClientset(&dep)
 	d := newTestDrainer(t, "node1", fakeCS)
 
 	w := workload.Workload{Kind: workload.KindDeployment, Namespace: "default", Name: "api"}
@@ -169,7 +169,7 @@ func makeStatefulSetForPreflight(ns, name string, replicas int32) appsv1.Statefu
 
 func TestPreflightStatefulSet_SingleReplica_IsRisk(t *testing.T) {
 	sts := makeStatefulSetForPreflight("default", "db", 1)
-	fakeCS := fake.NewSimpleClientset(&sts)
+	fakeCS := fake.NewClientset(&sts)
 	d := newTestDrainer(t, "node1", fakeCS)
 
 	w := workload.Workload{Kind: workload.KindStatefulSet, Namespace: "default", Name: "db"}
@@ -184,7 +184,7 @@ func TestPreflightStatefulSet_SingleReplica_IsRisk(t *testing.T) {
 
 func TestPreflightStatefulSet_MultiReplica_IsNote(t *testing.T) {
 	sts := makeStatefulSetForPreflight("default", "db", 3)
-	fakeCS := fake.NewSimpleClientset(&sts)
+	fakeCS := fake.NewClientset(&sts)
 	d := newTestDrainer(t, "node1", fakeCS)
 
 	w := workload.Workload{Kind: workload.KindStatefulSet, Namespace: "default", Name: "db"}
@@ -207,7 +207,7 @@ func TestPreflightStatefulSet_MultiReplica_IsNote(t *testing.T) {
 func TestRunPreflight_WarnMode_ReturnsNilOnRisk(t *testing.T) {
 	// Single-replica Deployment is a risk but warn mode should not abort.
 	dep := makeDeploymentForPreflight("default", "api", 1, appsv1.RollingUpdateDeploymentStrategyType)
-	fakeCS := fake.NewSimpleClientset(&dep)
+	fakeCS := fake.NewClientset(&dep)
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
 		o.Preflight = PreflightModeWarn
 	})
@@ -223,7 +223,7 @@ func TestRunPreflight_WarnMode_ReturnsNilOnRisk(t *testing.T) {
 
 func TestRunPreflight_StrictMode_ReturnsErrorOnRisk(t *testing.T) {
 	dep := makeDeploymentForPreflight("default", "api", 1, appsv1.RollingUpdateDeploymentStrategyType)
-	fakeCS := fake.NewSimpleClientset(&dep)
+	fakeCS := fake.NewClientset(&dep)
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
 		o.Preflight = PreflightModeStrict
 	})
@@ -239,7 +239,7 @@ func TestRunPreflight_StrictMode_ReturnsErrorOnRisk(t *testing.T) {
 
 func TestRunPreflight_StrictMode_NoRisk_ReturnsNil(t *testing.T) {
 	dep := makeDeploymentForPreflight("default", "api", 3, appsv1.RollingUpdateDeploymentStrategyType)
-	fakeCS := fake.NewSimpleClientset(&dep)
+	fakeCS := fake.NewClientset(&dep)
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
 		o.Preflight = PreflightModeStrict
 	})
@@ -254,7 +254,7 @@ func TestRunPreflight_StrictMode_NoRisk_ReturnsNil(t *testing.T) {
 }
 
 func TestRunPreflight_EmptyWorkloads_NoOp(t *testing.T) {
-	fakeCS := fake.NewSimpleClientset()
+	fakeCS := fake.NewClientset()
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
 		o.Preflight = PreflightModeStrict
 	})
@@ -268,7 +268,7 @@ func TestRunPreflight_StatefulNameDetected(t *testing.T) {
 	// A multi-replica Deployment named "postgres-api" should not be a risk but
 	// should trigger the stateful service note in warn mode (no error).
 	dep := makeDeploymentForPreflight("default", "postgres-api", 3, appsv1.RollingUpdateDeploymentStrategyType)
-	fakeCS := fake.NewSimpleClientset(&dep)
+	fakeCS := fake.NewClientset(&dep)
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
 		o.Preflight = PreflightModeStrict // strict: only errors on risk, not notes
 	})

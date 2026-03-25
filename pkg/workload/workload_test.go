@@ -103,7 +103,7 @@ func makeStatefulSet(ns, name string) appsv1.StatefulSet {
 // --------------------------------------------------------------------------
 
 func TestFinder_FindForNode_Empty(t *testing.T) {
-	client := fake.NewSimpleClientset()
+	client := fake.NewClientset()
 	f := workload.NewFinder(client)
 
 	wls, err := f.FindForNode(context.Background(), "node1")
@@ -120,7 +120,7 @@ func TestFinder_FindForNode_Deployment(t *testing.T) {
 	rs := makeRS("default", "api-rs1", "api")
 	pod := makePod("default", "api-pod1", []metav1.OwnerReference{ownerRef("ReplicaSet", "api-rs1")})
 
-	client := fake.NewSimpleClientset(&dep, &rs, &pod)
+	client := fake.NewClientset(&dep, &rs, &pod)
 	f := workload.NewFinder(client)
 
 	wls, err := f.FindForNode(context.Background(), "node1")
@@ -145,7 +145,7 @@ func TestFinder_FindForNode_StatefulSet(t *testing.T) {
 	sts := makeStatefulSet("default", "db")
 	pod := makePod("default", "db-0", []metav1.OwnerReference{ownerRef("StatefulSet", "db")})
 
-	client := fake.NewSimpleClientset(&sts, &pod)
+	client := fake.NewClientset(&sts, &pod)
 	f := workload.NewFinder(client)
 
 	wls, err := f.FindForNode(context.Background(), "node1")
@@ -166,7 +166,7 @@ func TestFinder_FindForNode_StatefulSet(t *testing.T) {
 func TestFinder_FindForNode_SkipsDaemonSet(t *testing.T) {
 	pod := makePod("default", "ds-pod", []metav1.OwnerReference{ownerRef("DaemonSet", "node-agent")})
 
-	client := fake.NewSimpleClientset(&pod)
+	client := fake.NewClientset(&pod)
 	f := workload.NewFinder(client)
 
 	wls, err := f.FindForNode(context.Background(), "node1")
@@ -181,7 +181,7 @@ func TestFinder_FindForNode_SkipsDaemonSet(t *testing.T) {
 func TestFinder_FindForNode_SkipsJob(t *testing.T) {
 	pod := makePod("default", "job-pod", []metav1.OwnerReference{ownerRef("Job", "batch-job")})
 
-	client := fake.NewSimpleClientset(&pod)
+	client := fake.NewClientset(&pod)
 	f := workload.NewFinder(client)
 
 	wls, err := f.FindForNode(context.Background(), "node1")
@@ -196,7 +196,7 @@ func TestFinder_FindForNode_SkipsJob(t *testing.T) {
 func TestFinder_FindForNode_SkipsStandalone(t *testing.T) {
 	pod := makePod("default", "standalone-pod", nil)
 
-	client := fake.NewSimpleClientset(&pod)
+	client := fake.NewClientset(&pod)
 	f := workload.NewFinder(client)
 
 	wls, err := f.FindForNode(context.Background(), "node1")
@@ -214,7 +214,7 @@ func TestFinder_FindForNode_SkipsTerminalPod(t *testing.T) {
 	pod := makePod("default", "api-pod-done", []metav1.OwnerReference{ownerRef("ReplicaSet", "api-rs1")})
 	pod.Status.Phase = corev1.PodSucceeded
 
-	client := fake.NewSimpleClientset(&dep, &rs, &pod)
+	client := fake.NewClientset(&dep, &rs, &pod)
 	f := workload.NewFinder(client)
 
 	wls, err := f.FindForNode(context.Background(), "node1")
@@ -233,7 +233,7 @@ func TestFinder_FindForNode_Deduplication(t *testing.T) {
 	pod1 := makePod("default", "api-pod1", []metav1.OwnerReference{ownerRef("ReplicaSet", "api-rs1")})
 	pod2 := makePod("default", "api-pod2", []metav1.OwnerReference{ownerRef("ReplicaSet", "api-rs1")})
 
-	client := fake.NewSimpleClientset(&dep, &rs, &pod1, &pod2)
+	client := fake.NewClientset(&dep, &rs, &pod1, &pod2)
 	f := workload.NewFinder(client)
 
 	wls, err := f.FindForNode(context.Background(), "node1")
@@ -250,7 +250,7 @@ func TestFinder_FindForNode_StandaloneRS(t *testing.T) {
 	rs := makeRS("default", "standalone-rs", "") // no Deployment owner
 	pod := makePod("default", "rs-pod", []metav1.OwnerReference{ownerRef("ReplicaSet", "standalone-rs")})
 
-	client := fake.NewSimpleClientset(&rs, &pod)
+	client := fake.NewClientset(&rs, &pod)
 	f := workload.NewFinder(client)
 
 	wls, err := f.FindForNode(context.Background(), "node1")
@@ -270,7 +270,7 @@ func TestFinder_FindForNode_MultipleWorkloads(t *testing.T) {
 	sts := makeStatefulSet("default", "db")
 	stsPod := makePod("default", "db-0", []metav1.OwnerReference{ownerRef("StatefulSet", "db")})
 
-	client := fake.NewSimpleClientset(&dep, &rs, &depPod, &sts, &stsPod)
+	client := fake.NewClientset(&dep, &rs, &depPod, &sts, &stsPod)
 	f := workload.NewFinder(client)
 
 	wls, err := f.FindForNode(context.Background(), "node1")
@@ -309,7 +309,7 @@ func TestFinder_FindForNode_Priority_Default(t *testing.T) {
 	rs := makeRS("default", "api-rs1", "api")
 	pod := makePod("default", "api-pod1", []metav1.OwnerReference{ownerRef("ReplicaSet", "api-rs1")})
 
-	client := fake.NewSimpleClientset(&dep, &rs, &pod)
+	client := fake.NewClientset(&dep, &rs, &pod)
 	f := workload.NewFinder(client)
 
 	wls, err := f.FindForNode(context.Background(), "node1")
@@ -329,7 +329,7 @@ func TestFinder_FindForNode_Priority_FromAnnotation(t *testing.T) {
 	rs := makeRS("default", "api-rs1", "api")
 	pod := makePod("default", "api-pod1", []metav1.OwnerReference{ownerRef("ReplicaSet", "api-rs1")})
 
-	client := fake.NewSimpleClientset(&dep, &rs, &pod)
+	client := fake.NewClientset(&dep, &rs, &pod)
 	f := workload.NewFinder(client)
 
 	wls, err := f.FindForNode(context.Background(), "node1")
@@ -349,7 +349,7 @@ func TestFinder_FindForNode_Priority_InvalidAnnotation_UsesDefault(t *testing.T)
 	rs := makeRS("default", "api-rs1", "api")
 	pod := makePod("default", "api-pod1", []metav1.OwnerReference{ownerRef("ReplicaSet", "api-rs1")})
 
-	client := fake.NewSimpleClientset(&dep, &rs, &pod)
+	client := fake.NewClientset(&dep, &rs, &pod)
 	f := workload.NewFinder(client)
 
 	wls, err := f.FindForNode(context.Background(), "node1")
@@ -366,7 +366,7 @@ func TestFinder_FindForNode_StatefulSet_Priority(t *testing.T) {
 	sts.Annotations = map[string]string{workload.DrainPriorityAnnotation: "200"}
 	pod := makePod("default", "db-0", []metav1.OwnerReference{ownerRef("StatefulSet", "db")})
 
-	client := fake.NewSimpleClientset(&sts, &pod)
+	client := fake.NewClientset(&sts, &pod)
 	f := workload.NewFinder(client)
 
 	wls, err := f.FindForNode(context.Background(), "node1")

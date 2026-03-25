@@ -1,3 +1,4 @@
+// Package cmd implements the kubectl-safed command-line interface.
 package cmd
 
 import (

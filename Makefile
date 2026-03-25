@@ -35,7 +35,7 @@ fmt: ## Format all Go source files
 lint: ## Run golangci-lint (requires golangci-lint to be installed)
 	golangci-lint run ./...
 
-check: fmt vet test ## Format, vet, and test
+check: fmt vet test lint ## Format, vet, test, and lint
 
 ## ── E2E tests ─────────────────────────────────────────────────────────────────
 

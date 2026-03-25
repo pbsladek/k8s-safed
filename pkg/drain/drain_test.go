@@ -42,16 +42,6 @@ func ownerRef(kind, name string) metav1.OwnerReference {
 	return metav1.OwnerReference{Kind: kind, Name: name}
 }
 
-func runningPod(ns, name string, owners ...metav1.OwnerReference) corev1.Pod {
-	return corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace:       ns,
-			Name:            name,
-			OwnerReferences: owners,
-		},
-		Status: corev1.PodStatus{Phase: corev1.PodRunning},
-	}
-}
 
 func readyNode(name string) corev1.Node {
 	return corev1.Node{
@@ -283,7 +273,7 @@ func TestDrainer_Cordon_AlreadyCordoned(t *testing.T) {
 	node := readyNode("node1")
 	node.Spec.Unschedulable = true
 
-	fakeCS := fake.NewSimpleClientset(&node)
+	fakeCS := fake.NewClientset(&node)
 	d := newTestDrainer(t, "node1", fakeCS)
 
 	if _, err := d.cordon(context.Background(), &node); err != nil {
@@ -300,7 +290,7 @@ func TestDrainer_Cordon_Patches(t *testing.T) {
 	node := readyNode("node1")
 	// node is schedulable (Unschedulable=false by default)
 
-	fakeCS := fake.NewSimpleClientset(&node)
+	fakeCS := fake.NewClientset(&node)
 	d := newTestDrainer(t, "node1", fakeCS)
 
 	if _, err := d.cordon(context.Background(), &node); err != nil {
@@ -314,7 +304,7 @@ func TestDrainer_Cordon_Patches(t *testing.T) {
 
 func TestDrainer_Cordon_DryRun(t *testing.T) {
 	node := readyNode("node1")
-	fakeCS := fake.NewSimpleClientset(&node)
+	fakeCS := fake.NewClientset(&node)
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) { o.DryRun = true })
 
 	if _, err := d.cordon(context.Background(), &node); err != nil {
@@ -331,7 +321,7 @@ func TestDrainer_Cordon_DryRun(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestDrainer_Run_NodeNotFound(t *testing.T) {
-	fakeCS := fake.NewSimpleClientset() // no node
+	fakeCS := fake.NewClientset() // no node
 	d := newTestDrainer(t, "node1", fakeCS)
 
 	if err := d.Run(context.Background()); err == nil {
@@ -341,7 +331,7 @@ func TestDrainer_Run_NodeNotFound(t *testing.T) {
 
 func TestDrainer_Run_DryRun(t *testing.T) {
 	node := readyNode("node1")
-	fakeCS := fake.NewSimpleClientset(&node)
+	fakeCS := fake.NewClientset(&node)
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) { o.DryRun = true })
 
 	if err := d.Run(context.Background()); err != nil {
@@ -357,7 +347,7 @@ func TestDrainer_Run_DryRun(t *testing.T) {
 func TestDrainer_Run_NoWorkloads(t *testing.T) {
 	// Only a node, no pods — should cordon then exit cleanly.
 	node := readyNode("node1")
-	fakeCS := fake.NewSimpleClientset(&node)
+	fakeCS := fake.NewClientset(&node)
 	d := newTestDrainer(t, "node1", fakeCS)
 
 	if err := d.Run(context.Background()); err != nil {
@@ -378,7 +368,7 @@ func TestDrainer_Run_MaxConcurrency_Parallel(t *testing.T) {
 	// With a fake client and no pods the full run should complete without error
 	// and the node should be cordoned.
 	node := readyNode("node1")
-	fakeCS := fake.NewSimpleClientset(&node)
+	fakeCS := fake.NewClientset(&node)
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
 		o.MaxConcurrency = 0 // unlimited
 	})
@@ -396,7 +386,7 @@ func TestDrainer_Run_MaxConcurrency_Batch(t *testing.T) {
 	// MaxConcurrency=2 with no workloads — exercises the batch path without
 	// needing real rollout infrastructure.
 	node := readyNode("node1")
-	fakeCS := fake.NewSimpleClientset(&node)
+	fakeCS := fake.NewClientset(&node)
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
 		o.MaxConcurrency = 2
 	})
@@ -432,7 +422,7 @@ func TestWaitForDeploymentRollout_ImmediateComplete(t *testing.T) {
 		},
 	}
 
-	fakeCS := fake.NewSimpleClientset(&dep)
+	fakeCS := fake.NewClientset(&dep)
 	d := newTestDrainer(t, "node1", fakeCS)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -465,7 +455,7 @@ func TestWaitForDeploymentRollout_ProgressDeadlineExceeded(t *testing.T) {
 		},
 	}
 
-	fakeCS := fake.NewSimpleClientset(&dep)
+	fakeCS := fake.NewClientset(&dep)
 	d := newTestDrainer(t, "node1", fakeCS)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -500,7 +490,7 @@ func TestWaitForStatefulSetRollout_ImmediateComplete(t *testing.T) {
 		},
 	}
 
-	fakeCS := fake.NewSimpleClientset(&sts)
+	fakeCS := fake.NewClientset(&sts)
 	d := newTestDrainer(t, "node1", fakeCS)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -530,7 +520,7 @@ func TestWaitForStatefulSetRollout_EmptyRevisionNotComplete(t *testing.T) {
 		},
 	}
 
-	fakeCS := fake.NewSimpleClientset(&sts)
+	fakeCS := fake.NewClientset(&sts)
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
 		o.RolloutTimeout = 50 * time.Millisecond
 	})
@@ -558,7 +548,7 @@ func makeWorkload(kind workload.Kind, ns, name string) workload.Workload {
 }
 
 func TestFilterWorkloads_NoFilter_ReturnsAll(t *testing.T) {
-	fakeCS := fake.NewSimpleClientset()
+	fakeCS := fake.NewClientset()
 	d := newTestDrainer(t, "node1", fakeCS)
 
 	wls := []workload.Workload{
@@ -572,7 +562,7 @@ func TestFilterWorkloads_NoFilter_ReturnsAll(t *testing.T) {
 }
 
 func TestFilterWorkloads_SkipWorkload_Removes(t *testing.T) {
-	fakeCS := fake.NewSimpleClientset()
+	fakeCS := fake.NewClientset()
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
 		o.SkipWorkloads = map[string]bool{"Deployment/default/api": true}
 	})
@@ -591,7 +581,7 @@ func TestFilterWorkloads_SkipWorkload_Removes(t *testing.T) {
 }
 
 func TestFilterWorkloads_OnlyWorkload_KeepsOnlyNamed(t *testing.T) {
-	fakeCS := fake.NewSimpleClientset()
+	fakeCS := fake.NewClientset()
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
 		o.OnlyWorkloads = map[string]bool{"StatefulSet/default/db": true}
 	})
@@ -611,7 +601,7 @@ func TestFilterWorkloads_OnlyWorkload_KeepsOnlyNamed(t *testing.T) {
 }
 
 func TestFilterWorkloads_SkipAll_ReturnsEmpty(t *testing.T) {
-	fakeCS := fake.NewSimpleClientset()
+	fakeCS := fake.NewClientset()
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
 		o.SkipWorkloads = map[string]bool{
 			"Deployment/default/api": true,

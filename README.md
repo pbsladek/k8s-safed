@@ -1,6 +1,7 @@
 # kubectl-safed
 
 [![CI](https://github.com/pbsladek/k8s-safed/actions/workflows/ci.yml/badge.svg)](https://github.com/pbsladek/k8s-safed/actions/workflows/ci.yml)
+[![E2E](https://github.com/pbsladek/k8s-safed/actions/workflows/e2e.yml/badge.svg)](https://github.com/pbsladek/k8s-safed/actions/workflows/e2e.yml)
 
 A `kubectl` krew plugin for draining Kubernetes nodes using rolling restarts
 rather than direct pod eviction.
@@ -135,13 +136,22 @@ it on your `PATH` as `kubectl-safed`:
 
 ```bash
 # macOS ARM64 example
-VERSION=$(curl -s https://api.github.com/repos/pbsladek/k8s-safed/releases/latest \
+VERSION=$(curl -fsSL https://api.github.com/repos/pbsladek/k8s-safed/releases/latest \
   | grep '"tag_name"' | cut -d'"' -f4)
-curl -Lo kubectl-safed.tar.gz \
-  "https://github.com/pbsladek/k8s-safed/releases/download/${VERSION}/kubectl-safed_darwin_arm64.tar.gz"
-tar -xzf kubectl-safed.tar.gz
-chmod +x kubectl-safed_darwin_arm64/kubectl-safed
-sudo mv kubectl-safed_darwin_arm64/kubectl-safed /usr/local/bin/kubectl-safed
+BASE="https://github.com/pbsladek/k8s-safed/releases/download/${VERSION}"
+
+curl -fsSLO "${BASE}/kubectl-safed_darwin_arm64.tar.gz"
+curl -fsSLO "${BASE}/checksums.txt"
+
+# Verify checksum before extracting (macOS: shasum; Linux: sha256sum)
+if command -v sha256sum &>/dev/null; then
+  grep "kubectl-safed_darwin_arm64.tar.gz" checksums.txt | sha256sum --check
+else
+  grep "kubectl-safed_darwin_arm64.tar.gz" checksums.txt | shasum -a 256 --check
+fi
+
+tar -xzf kubectl-safed_darwin_arm64.tar.gz
+sudo install -m 0755 kubectl-safed_darwin_arm64/kubectl-safed /usr/local/bin/kubectl-safed
 
 # Verify
 kubectl safed --help
