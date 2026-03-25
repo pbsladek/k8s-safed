@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   release:
-    name: Build & Release
+    name: release
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -82,7 +82,7 @@ jobs:
   #   4. Uncomment this job.
   # ---------------------------------------------------------------------------
   # submit-to-krew-index:
-  #   name: Submit to krew-index
+  #   name: submit to krew-index
   #   needs: release
   #   runs-on: ubuntu-latest
   #   steps:
