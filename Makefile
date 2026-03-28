@@ -56,10 +56,10 @@ tidy: ## Tidy go.mod and go.sum
 
 ## ── Release ──────────────────────────────────────────────────────────────────
 
-release: ## Tag and push a release: make release VERSION=v0.x.0
-	@test -n "$(VERSION)" || (echo "Usage: make release VERSION=v0.x.0" && exit 1)
-	git tag "$(VERSION)"
-	git push origin "$(VERSION)"
+release: ## Merge the open release-please PR to trigger a release
+	@PR=$$(gh pr list --label "autorelease: pending" --json number --jq '.[0].number'); \
+	if [ -z "$$PR" ]; then echo "No release-please PR found"; exit 1; fi; \
+	gh pr merge "$$PR" --squash --auto
 
 snapshot: ## Build a local multi-arch snapshot via GoReleaser (no publish)
 	goreleaser release --snapshot --clean
