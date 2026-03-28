@@ -6,7 +6,7 @@ LDFLAGS    := -s -w
 # Respect GOBIN / PATH install location; default to /usr/local/bin.
 INSTALL_DIR ?= /usr/local/bin
 
-.PHONY: all build test vet lint fmt check install clean snapshot help e2e e2e-run
+.PHONY: all build test vet lint fmt check install clean release snapshot help e2e e2e-run
 
 all: check build ## Run checks then build (default)
 
@@ -35,7 +35,7 @@ fmt: ## Format all Go source files
 lint: ## Run golangci-lint (requires golangci-lint to be installed)
 	golangci-lint run ./...
 
-check: fmt vet test ## Format, vet, and test
+check: fmt vet test lint ## Format, vet, test, and lint
 
 ## ── E2E tests ─────────────────────────────────────────────────────────────────
 
@@ -55,6 +55,11 @@ tidy: ## Tidy go.mod and go.sum
 	go mod tidy
 
 ## ── Release ──────────────────────────────────────────────────────────────────
+
+release: ## Merge the open release-please PR to trigger a release
+	@PR=$$(gh pr list --label "autorelease: pending" --json number --jq '.[0].number'); \
+	if [ -z "$$PR" ]; then echo "No release-please PR found"; exit 1; fi; \
+	gh pr merge "$$PR" --squash --auto
 
 snapshot: ## Build a local multi-arch snapshot via GoReleaser (no publish)
 	goreleaser release --snapshot --clean

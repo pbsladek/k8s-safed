@@ -55,38 +55,15 @@ source:
   enabled: true
   name_template: "{{ .ProjectName }}_{{ .Tag }}_source"
 
-changelog:
-  sort: asc
-  use: github
-  filters:
-    exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
-      - "Merge pull request"
-      - "Merge branch"
-  groups:
-    - title: New Features
-      regexp: "^feat"
-      order: 0
-    - title: Bug Fixes
-      regexp: "^fix"
-      order: 1
-    - title: Performance
-      regexp: "^perf"
-      order: 2
-    - title: Other Changes
-      order: 999
-
 release:
   github:
     owner: pbsladek
     name: k8s-safed
-  name_template: "{{ .Tag }}"
+  # release-please creates the GitHub Release with the changelog body.
+  # keep-existing preserves those release notes; GoReleaser only uploads
+  # the binary archives and checksums.
+  mode: keep-existing
+  # Allow re-running the goreleaser job without failing on duplicate uploads.
+  replace_existing_artifacts: true
   draft: false
   prerelease: auto
-  # Extra files to upload alongside the binaries.
-  # plugin.yaml is generated and uploaded by the release workflow after
-  # GoReleaser runs and checksums are available.
-  extra_files:
-    - glob: plugin.yaml
