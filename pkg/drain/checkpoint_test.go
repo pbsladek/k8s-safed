@@ -244,7 +244,7 @@ func TestRunWorkloads_Resume_SkipsCompletedWorkloads(t *testing.T) {
 	// A drainer with Resume=true — no real cluster needed since all workloads
 	// should be skipped before any API calls.
 	node := readyNode("node1")
-	fakeCS := fake.NewSimpleClientset(&node)
+	fakeCS := fake.NewClientset(&node)
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
 		o.Resume = true
 		o.CheckpointPath = cpPath

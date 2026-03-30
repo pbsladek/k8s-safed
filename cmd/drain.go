@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/pbsladek/k8s-safed/pkg/config"
@@ -264,27 +265,48 @@ func sliceToSet(ss []string) map[string]bool {
 
 // resolveNodeNames returns the list of node names to drain. When nodeSelector
 // is non-empty, it lists nodes matching that label selector; otherwise it
-// returns nodeArgs directly.
+// returns nodeArgs directly. Transient API errors are retried up to 3 times.
 func resolveNodeNames(ctx context.Context, client *k8s.Client, nodeArgs []string, nodeSelector string) ([]string, error) {
 	if nodeSelector == "" {
 		return nodeArgs, nil
 	}
 
-	list, err := client.Kubernetes.CoreV1().Nodes().List(ctx, metav1.ListOptions{
-		LabelSelector: nodeSelector,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("listing nodes with selector %q: %w", nodeSelector, err)
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		nodeList, err := client.Kubernetes.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+			LabelSelector: nodeSelector,
+		})
+		if err != nil {
+			if isTransientCmdError(err) {
+				select {
+				case <-ctx.Done():
+					return nil, fmt.Errorf("listing nodes with selector %q: %w", nodeSelector, err)
+				case <-time.After(2 * time.Second):
+				}
+				lastErr = err
+				continue
+			}
+			return nil, fmt.Errorf("listing nodes with selector %q: %w", nodeSelector, err)
+		}
+		if len(nodeList.Items) == 0 {
+			return nil, fmt.Errorf("no nodes matched selector %q", nodeSelector)
+		}
+		names := make([]string, len(nodeList.Items))
+		for i, n := range nodeList.Items {
+			names[i] = n.Name
+		}
+		return names, nil
 	}
-	if len(list.Items) == 0 {
-		return nil, fmt.Errorf("no nodes matched selector %q", nodeSelector)
-	}
+	return nil, fmt.Errorf("listing nodes with selector %q: %w", nodeSelector, lastErr)
+}
 
-	names := make([]string, len(list.Items))
-	for i, n := range list.Items {
-		names[i] = n.Name
-	}
-	return names, nil
+// isTransientCmdError mirrors drain.isTransientAPIError for use in the cmd package.
+func isTransientCmdError(err error) bool {
+	return k8serrors.IsInternalError(err) ||
+		k8serrors.IsServerTimeout(err) ||
+		k8serrors.IsTimeout(err) ||
+		k8serrors.IsTooManyRequests(err)
 }
 
 // applyProfile loads the named profile from the config file and applies its

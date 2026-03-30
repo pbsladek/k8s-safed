@@ -38,8 +38,8 @@ echo "  Fork:    ${KREW_INDEX_FORK}"
 echo "  Branch:  ${BRANCH}"
 echo "  Workdir: ${WORKDIR}"
 
-# Use the token for all HTTPS git operations within this script.
-git config --global url."https://x-access-token:${KREW_GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+# Authenticate the GitHub CLI with the token so git push and gh pr create both work.
+echo "${KREW_GITHUB_TOKEN}" | gh auth login --with-token
 
 # Clone the fork (shallow is fine — we only need HEAD).
 git clone --depth=1 "https://github.com/${KREW_INDEX_FORK}.git" "${WORKDIR}/krew-index"

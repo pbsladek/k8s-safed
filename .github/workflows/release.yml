@@ -2,36 +2,50 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
 
-# GoReleaser and the manifest-update step both need write access.
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
-  release:
-    name: Build & Release
+  release-please:
+    name: release please
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - name: Release please
+        id: rp
+        uses: googleapis/release-please-action@16a9c90856f42705d54a6fda1823352bdc62cf38 # v4.4.0
+        with:
+          release-type: go
+
+  goreleaser:
+    name: goreleaser
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          # Full history is required for GoReleaser's changelog generation.
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
           go-version-file: go.mod
           cache: true
 
-      # -----------------------------------------------------------------------
-      # Build multi-arch binaries, create archives, publish the GitHub release.
-      # Artifacts land in ./dist/ for use by later steps.
-      # -----------------------------------------------------------------------
+      # Uploads multi-arch binary archives and checksums to the GitHub Release
+      # that release-please already created. mode: keep-existing-fields preserves
+      # the release notes written by release-please.
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7.0.0
         with:
           distribution: goreleaser
           version: "~> v2"
@@ -39,34 +53,30 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # -----------------------------------------------------------------------
       # Rewrite plugin.yaml with real download URLs and SHA256 checksums from
       # the GoReleaser-produced dist/checksums.txt, then attach the manifest
       # to the release so users can install with:
       #   kubectl krew install --manifest-url \
       #     https://github.com/pbsladek/k8s-safed/releases/latest/download/plugin.yaml
-      # -----------------------------------------------------------------------
       - name: Update krew plugin manifest
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ needs.release-please.outputs.tag_name }}
         run: python3 scripts/update-krew-manifest.py
 
       - name: Upload plugin.yaml to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ needs.release-please.outputs.tag_name }}
         run: gh release upload "${VERSION}" plugin.yaml --clobber
 
-      # -----------------------------------------------------------------------
       # Push the updated plugin.yaml to main so the raw GitHub URL always
       # reflects the latest release:
       #   kubectl krew install --manifest-url \
       #     https://raw.githubusercontent.com/pbsladek/k8s-safed/main/plugin.yaml
-      # [skip ci] in the commit message prevents re-triggering the CI workflow.
-      # -----------------------------------------------------------------------
+      # [skip ci] in the commit message prevents re-triggering this workflow.
       - name: Commit updated plugin.yaml to main
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ needs.release-please.outputs.tag_name }}
         run: bash scripts/commit-manifest.sh
 
   # ---------------------------------------------------------------------------
@@ -82,16 +92,17 @@ jobs:
   #   4. Uncomment this job.
   # ---------------------------------------------------------------------------
   # submit-to-krew-index:
-  #   name: Submit to krew-index
-  #   needs: release
+  #   name: submit to krew-index
+  #   needs: [release-please, goreleaser]
+  #   if: needs.release-please.outputs.release_created == 'true'
   #   runs-on: ubuntu-latest
   #   steps:
   #     - name: Checkout
-  #       uses: actions/checkout@v4
+  #       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
   #
   #     - name: Open krew-index PR
   #       env:
   #         KREW_GITHUB_TOKEN: ${{ secrets.KREW_INDEX_PR_TOKEN }}
   #         KREW_INDEX_FORK:   ${{ vars.KREW_INDEX_FORK }}
-  #         VERSION:           ${{ github.ref_name }}
+  #         VERSION:           ${{ needs.release-please.outputs.tag_name }}
   #       run: bash scripts/submit-to-krew-index.sh

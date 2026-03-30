@@ -1,0 +1,25 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck      # unchecked error return values
+    - govet         # go vet checks
+    - staticcheck   # static analysis (includes gosimple, stylecheck)
+    - ineffassign   # assignments that are never used
+    - unused        # unused code (replaces deadcode/varcheck/structcheck)
+    - misspell      # spelling mistakes in comments and strings
+
+  settings:
+    errcheck:
+      # json.Marshal on map[string]any with only string values cannot fail;
+      # the blank identifier is intentional and documented at the call site.
+      exclude-functions:
+        - encoding/json.Marshal
+
+run:
+  timeout: 5m
+
+issues:
+  max-same-issues: 0
+  max-issues-per-linter: 0

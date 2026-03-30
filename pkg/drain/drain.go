@@ -1,3 +1,4 @@
+// Package drain implements safe Kubernetes node draining via rolling restarts.
 package drain
 
 import (
@@ -187,8 +188,12 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 
 	// Step 1: Validate node.
 	out.Infof(d.opts.NodeName, "Validating %q", d.opts.NodeName)
-	node, err := d.client.CoreV1().Nodes().Get(ctx, d.opts.NodeName, metav1.GetOptions{})
-	if err != nil {
+	var node *corev1.Node
+	if err := retryTransient(ctx, d.pollInterval(), func() error {
+		var e error
+		node, e = d.client.CoreV1().Nodes().Get(ctx, d.opts.NodeName, metav1.GetOptions{})
+		return e
+	}); err != nil {
 		return fmt.Errorf("node %q not found: %w", d.opts.NodeName, err)
 	}
 	out.Infof(d.opts.NodeName, "Found · kernel=%s ready=%v",
@@ -197,8 +202,12 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 	// Step 2: Discover workloads — before any cluster changes so pre-flight
 	// can see the full picture and the operator can abort without side effects.
 	out.Info(d.opts.NodeName, "Discovering managed workloads...")
-	workloads, err := d.finder.FindForNode(ctx, d.opts.NodeName)
-	if err != nil {
+	var workloads []workload.Workload
+	if err := retryTransient(ctx, d.pollInterval(), func() error {
+		var e error
+		workloads, e = d.finder.FindForNode(ctx, d.opts.NodeName)
+		return e
+	}); err != nil {
 		return fmt.Errorf("discovering workloads: %w", err)
 	}
 
@@ -270,7 +279,9 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 		out.DryRunf(d.opts.NodeName, "Dry-run complete — no changes were made to %q", d.opts.NodeName)
 	} else {
 		elapsed := time.Since(start).Round(time.Second)
-		d.events.NodeEvent(ctx, d.opts.NodeName, "Drained",
+		// Use context.Background() so the event is reliably emitted even if
+		// the drain context expired right as the last workload completed.
+		d.events.NodeEvent(context.Background(), d.opts.NodeName, "Drained",
 			fmt.Sprintf("kubectl-safed: drain of %q complete (%s)", d.opts.NodeName, elapsed),
 			corev1.EventTypeNormal)
 		out.Elapsed(start, d.opts.NodeName, fmt.Sprintf("Drained %q", d.opts.NodeName))
@@ -510,7 +521,7 @@ func (d *Drainer) rollingRestart(ctx context.Context, w workload.Workload) error
 			return err
 		}
 		if err := d.waitForDeploymentRollout(ctx, w.Namespace, w.Name, preGen); err != nil {
-			return fmt.Errorf("Deployment %s/%s rollout failed: %w", w.Namespace, w.Name, err)
+			return fmt.Errorf("deployment %s/%s rollout failed: %w", w.Namespace, w.Name, err)
 		}
 
 	case workload.KindStatefulSet:
@@ -622,10 +633,21 @@ func (d *Drainer) waitForDeploymentRollout(ctx context.Context, namespace, name 
 		rolloutCtx, cancel = context.WithTimeout(ctx, d.opts.RolloutTimeout)
 		defer cancel()
 	}
+	// Cache the new ReplicaSet's selector so we only list ReplicaSets once
+	// per revision instead of on every poll tick. The revision annotation on a
+	// Deployment does not change mid-rollout; if a concurrent restart bumps it
+	// we refresh automatically by detecting the changed revision string.
+	var (
+		cachedDepRevision string
+		cachedNewSel      *metav1.LabelSelector
+	)
 	return wait.PollUntilContextCancel(rolloutCtx, d.pollInterval(), true,
 		func(ctx context.Context) (bool, error) {
 			dep, err := d.client.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
+				if isTransientAPIError(err) {
+					return false, nil // retry on next tick
+				}
 				return false, err
 			}
 			s := dep.Status
@@ -662,11 +684,21 @@ func (d *Drainer) waitForDeploymentRollout(ctx context.Context, namespace, name 
 			// for ProgressDeadlineExceeded (cluster default: 600 s).
 			// Use the new ReplicaSet's selector so we only check new-revision
 			// pods and avoid false-positives on old pods being replaced.
-			newSel, err := d.newReplicaSetSelector(ctx, dep)
-			if err != nil {
-				return false, fmt.Errorf("resolving new ReplicaSet selector: %w", err)
+			depRevision := dep.Annotations["deployment.kubernetes.io/revision"]
+			if depRevision != cachedDepRevision {
+				cachedNewSel, err = d.newReplicaSetSelector(ctx, dep)
+				if err != nil {
+					if isTransientAPIError(err) {
+						return false, nil
+					}
+					return false, fmt.Errorf("resolving new ReplicaSet selector: %w", err)
+				}
+				cachedDepRevision = depRevision
 			}
-			if reason, pod, err := d.findBadPodState(ctx, namespace, newSel); err != nil {
+			if reason, pod, err := d.findBadPodState(ctx, namespace, cachedNewSel); err != nil {
+				if isTransientAPIError(err) {
+					return false, nil
+				}
 				return false, fmt.Errorf("checking pod states: %w", err)
 			} else if reason != "" {
 				return false, fmt.Errorf("pod %s/%s stuck in %s — rollout will not complete", pod.Namespace, pod.Name, reason)
@@ -681,15 +713,6 @@ func (d *Drainer) waitForDeploymentRollout(ctx context.Context, namespace, name 
 	)
 }
 
-// waitForStatefulSetRollout polls until the StatefulSet's rollout is complete.
-//
-// The correct terminal condition is:
-//   - UpdateRevision == CurrentRevision (all pods at the new revision)
-//   - UpdatedReplicas == desired         (controller updated all pods)
-//   - ReadyReplicas == desired           (all pods passing readiness probes)
-//
-// Note: CurrentReplicas counts pods at the OLD revision during a rolling update
-// and must NOT be used as the completion indicator.
 // waitForStatefulSetRollout polls until the StatefulSet's rollout is complete.
 //
 // targetGeneration is the Generation from the PATCH response.
@@ -721,10 +744,20 @@ func (d *Drainer) waitForStatefulSetRollout(ctx context.Context, namespace, name
 		rolloutCtx, cancel = context.WithTimeout(ctx, d.opts.RolloutTimeout)
 		defer cancel()
 	}
+	// Cache the revision selector to avoid allocating a new map on every tick.
+	// UpdateRevision is stable once set for the duration of a rollout; we only
+	// rebuild when it changes (empty → hash at rollout start).
+	var (
+		cachedUpdateRevision string
+		cachedRevSel         *metav1.LabelSelector
+	)
 	return wait.PollUntilContextCancel(rolloutCtx, d.pollInterval(), true,
 		func(ctx context.Context) (bool, error) {
 			sts, err := d.client.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
+				if isTransientAPIError(err) {
+					return false, nil // retry on next tick
+				}
 				return false, err
 			}
 			s := sts.Status
@@ -753,8 +786,14 @@ func (d *Drainer) waitForStatefulSetRollout(ctx context.Context, namespace, name
 			// UpdateRevision) so we don't false-positive on old pods that
 			// are still being replaced. Fall back to the broad selector
 			// if UpdateRevision is not yet set.
-			revSel := newRevisionSelector(sts.Spec.Selector, s.UpdateRevision)
-			if reason, pod, err := d.findBadPodState(ctx, namespace, revSel); err != nil {
+			if s.UpdateRevision != cachedUpdateRevision {
+				cachedRevSel = newRevisionSelector(sts.Spec.Selector, s.UpdateRevision)
+				cachedUpdateRevision = s.UpdateRevision
+			}
+			if reason, pod, err := d.findBadPodState(ctx, namespace, cachedRevSel); err != nil {
+				if isTransientAPIError(err) {
+					return false, nil
+				}
 				return false, fmt.Errorf("checking pod states: %w", err)
 			} else if reason != "" {
 				return false, fmt.Errorf("pod %s/%s stuck in %s — rollout will not complete", pod.Namespace, pod.Name, reason)
@@ -794,6 +833,9 @@ func (d *Drainer) waitForPodsOffNode(ctx context.Context, w workload.Workload) e
 				FieldSelector: "spec.nodeName=" + d.opts.NodeName,
 			})
 			if err != nil {
+				if isTransientAPIError(err) {
+					return false, nil // retry on next tick
+				}
 				return false, err
 			}
 
@@ -949,6 +991,37 @@ func badWaitingReason(cs corev1.ContainerStatus) string {
 		return cs.State.Waiting.Reason
 	}
 	return ""
+}
+
+// isTransientAPIError reports whether err is a transient Kubernetes API error
+// that may resolve on the next poll tick: server timeouts, internal errors, or
+// temporary rate limiting. Transient errors in poll condition functions should
+// return (false, nil) so the poll retries rather than aborting the drain.
+func isTransientAPIError(err error) bool {
+	return k8serrors.IsInternalError(err) ||
+		k8serrors.IsServerTimeout(err) ||
+		k8serrors.IsTimeout(err) ||
+		k8serrors.IsTooManyRequests(err)
+}
+
+// retryTransient calls fn up to 3 times, retrying after interval when the
+// returned error is a transient Kubernetes API error. The first non-transient
+// error is returned immediately. Context cancellation stops the retry loop.
+func retryTransient(ctx context.Context, interval time.Duration, fn func() error) error {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		lastErr = fn()
+		if lastErr == nil || !isTransientAPIError(lastErr) {
+			return lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return lastErr
+		case <-time.After(interval):
+		}
+	}
+	return lastErr
 }
 
 // buildLabelSelectorString converts a *metav1.LabelSelector to the string form
@@ -1141,7 +1214,7 @@ func isJobPod(pod *corev1.Pod) bool {
 
 func hasEmptyDir(pod *corev1.Pod) bool {
 	for _, v := range pod.Spec.Volumes {
-		if v.VolumeSource.EmptyDir != nil {
+		if v.EmptyDir != nil {
 			return true
 		}
 	}

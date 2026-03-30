@@ -149,14 +149,14 @@ func (p *Printer) emit(level, subject, msg string) {
 			"subject": subject,
 			"msg":     msg,
 		}
-		data, _ := json.Marshal(rec)
-		fmt.Fprintln(p.out, string(data))
+		data, _ := json.Marshal(rec) // safe: map contains only string values
+		_, _ = fmt.Fprintln(p.out, string(data))
 
 	default: // LogFormatPlain
 		ts := now.Format("15:04:05")
 		// Pad subject to subjectWidth so that message columns align across
 		// node-level ("node", 4 chars) and workload-level lines.
-		fmt.Fprintf(p.out, "[safed] %s  %-*s  %-6s  %s\n",
+		_, _ = fmt.Fprintf(p.out, "[safed] %s  %-*s  %-6s  %s\n",
 			ts, subjectWidth, subject, level, msg)
 	}
 }
