@@ -22,19 +22,9 @@ jobs:
 
       - uses: actions/configure-pages@v4
 
-      - name: Prepare Pages source
-        run: |
-          mkdir -p _pages/examples
-          cp -R docs/. _pages/
-          cp examples/*.yaml _pages/examples/
-          {
-            printf '%s\n' '---' 'layout: default' 'title: Examples' 'nav_order: 3' '---' ''
-            sed '1s/^# kubectl-safed Examples/# Examples/' examples/README.md
-          } > _pages/examples/index.md
-
       - uses: actions/jekyll-build-pages@v1
         with:
-          source: ./_pages
+          source: ./docs
           destination: ./_site
 
       - uses: actions/upload-pages-artifact@v3

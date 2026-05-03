@@ -1,3 +1,9 @@
+---
+layout: default
+title: Examples
+nav_order: 3
+---
+
 # kubectl-safed Examples
 
 These examples are written as real operational patterns. Replace node names,
@@ -240,4 +246,3 @@ until the node is terminated.
 - [rbac.yaml](rbac.yaml): ClusterRole example for the tool.
 - [profiles.yaml](profiles.yaml): profile examples for production, staging,
   and spot/node-pool workflows.
-

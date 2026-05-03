@@ -9,7 +9,7 @@ Start here:
 
 - [User guide](user-guide.md): complete behavior, installation, command
   reference, RBAC, profiles, logging, checkpoints, and edge cases.
-- [Examples](../examples/README.md): real-world drain commands and reusable
+- [Examples](examples/README.md): real-world drain commands and reusable
   profile/RBAC examples.
 - [Project README](../README.md): short project overview, release, and
   contribution notes.
@@ -47,4 +47,3 @@ It cannot make unsafe workload designs safe. Single-replica workloads,
 Deployments using `Recreate`, and applications that cannot tolerate their own
 rolling restart can still see downtime. Use `--preflight=strict` for production
 paths where these risks should abort the drain before cordoning.
-

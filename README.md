@@ -6,8 +6,8 @@
 A `kubectl` krew plugin for draining Kubernetes nodes using rolling restarts
 rather than direct pod eviction.
 
-Full documentation lives in [docs/](docs/). Real-world command patterns and
-reusable manifests live in [examples/](examples/).
+Full documentation, real-world command patterns, and reusable manifests live in
+[docs/](docs/).
 
 Instead of evicting pods — which can violate PodDisruptionBudgets and
 terminate traffic-serving containers before replacements are ready —
