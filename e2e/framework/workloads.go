@@ -13,9 +13,219 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
+// DeploymentManifestOptions describes a small Deployment used by e2e tests.
+type DeploymentManifestOptions struct {
+	Namespace               string
+	Name                    string
+	Priority                int
+	Replicas                int32
+	MinReadySeconds         int32
+	ProgressDeadlineSeconds int32
+	Recreate                bool
+	Image                   string
+	Command                 string
+	ReadinessCommand        string
+}
+
 // --------------------------------------------------------------------------
 // Raw manifests — applied with kubectl, not helm
 // --------------------------------------------------------------------------
+
+// DeploymentManifest returns a small busybox Deployment with app=<name>.
+func DeploymentManifest(opts DeploymentManifestOptions) string {
+	ns := namespaceOrDefault(opts.Namespace)
+	replicas := opts.Replicas
+	if replicas == 0 {
+		replicas = 1
+	}
+	image := opts.Image
+	if image == "" {
+		image = "mirror.gcr.io/library/busybox:1.36"
+	}
+	command := opts.Command
+	if command == "" {
+		command = "while true; do sleep 3600; done"
+	}
+
+	minReady := ""
+	if opts.MinReadySeconds > 0 {
+		minReady = fmt.Sprintf("  minReadySeconds: %d\n", opts.MinReadySeconds)
+	}
+	progressDeadline := ""
+	if opts.ProgressDeadlineSeconds > 0 {
+		progressDeadline = fmt.Sprintf("  progressDeadlineSeconds: %d\n", opts.ProgressDeadlineSeconds)
+	}
+	strategy := ""
+	if opts.Recreate {
+		strategy = "  strategy:\n    type: Recreate\n"
+	}
+	readiness := ""
+	if opts.ReadinessCommand != "" {
+		readiness = fmt.Sprintf(`        readinessProbe:
+          exec:
+            command: ["/bin/sh", "-c", %q]
+          periodSeconds: 1
+          failureThreshold: 1
+`, opts.ReadinessCommand)
+	}
+
+	return fmt.Sprintf(`
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %s
+  namespace: %s
+  annotations:
+    kubectl.safed.io/drain-priority: "%d"
+spec:
+  replicas: %d
+%s%s%s  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      terminationGracePeriodSeconds: 2
+      containers:
+      - name: app
+        image: %s
+        command: ["/bin/sh", "-c", %q]
+%s        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+`, opts.Name, ns, opts.Priority, replicas, minReady, progressDeadline, strategy, opts.Name, opts.Name, image, command, readiness)
+}
+
+// StandalonePodManifest returns an unmanaged Pod with app=<name>.
+func StandalonePodManifest(namespace, name string, emptyDir bool) string {
+	volumeMount := ""
+	volume := ""
+	if emptyDir {
+		volumeMount = `    volumeMounts:
+    - name: scratch
+      mountPath: /scratch
+`
+		volume = `  volumes:
+  - name: scratch
+    emptyDir: {}
+`
+	}
+	return fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+    app: %s
+spec:
+  terminationGracePeriodSeconds: 2
+  containers:
+  - name: app
+    image: mirror.gcr.io/library/busybox:1.36
+    command: ["/bin/sh", "-c", "while true; do sleep 3600; done"]
+%s    resources:
+      requests:
+        cpu: 10m
+        memory: 8Mi
+%s`, name, namespaceOrDefault(namespace), name, volumeMount, volume)
+}
+
+// ReplicaSetManifest returns a standalone ReplicaSet with app=<name>.
+func ReplicaSetManifest(namespace, name string, emptyDir bool) string {
+	volumeMount := ""
+	volume := ""
+	if emptyDir {
+		volumeMount = `        volumeMounts:
+        - name: scratch
+          mountPath: /scratch
+`
+		volume = `      volumes:
+      - name: scratch
+        emptyDir: {}
+`
+	}
+	return fmt.Sprintf(`
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: %s
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      terminationGracePeriodSeconds: 2
+      containers:
+      - name: app
+        image: mirror.gcr.io/library/busybox:1.36
+        command: ["/bin/sh", "-c", "while true; do sleep 3600; done"]
+%s        resources:
+          requests:
+            cpu: 10m
+            memory: 8Mi
+%s`, name, namespaceOrDefault(namespace), name, name, volumeMount, volume)
+}
+
+// JobManifest returns a long-running Job with app=<name>.
+func JobManifest(namespace, name string) string {
+	return fmt.Sprintf(`
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: %s
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 2
+      containers:
+      - name: app
+        image: mirror.gcr.io/library/busybox:1.36
+        command: ["/bin/sh", "-c", "while true; do sleep 3600; done"]
+        resources:
+          requests:
+            cpu: 10m
+            memory: 8Mi
+`, name, namespaceOrDefault(namespace), name)
+}
+
+// PDBManifest returns a PodDisruptionBudget selecting app=<app>.
+func PDBManifest(namespace, name, app string, maxUnavailable int) string {
+	return fmt.Sprintf(`
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  maxUnavailable: %d
+  selector:
+    matchLabels:
+      app: %s
+`, name, namespaceOrDefault(namespace), maxUnavailable, app)
+}
+
+func namespaceOrDefault(ns string) string {
+	if ns != "" {
+		return ns
+	}
+	return E2ENamespace
+}
 
 // WorkerManifest is a single-replica Deployment used only by preflight tests
 // to trigger the "single-replica risk" detection.
@@ -38,7 +248,7 @@ spec:
       terminationGracePeriodSeconds: 2
       containers:
       - name: worker
-        image: busybox:1.36
+        image: mirror.gcr.io/library/busybox:1.36
         command: ["/bin/sh", "-c", "while true; do sleep 3600; done"]
         resources:
           requests:
@@ -68,7 +278,7 @@ spec:
       - operator: Exists
       containers:
       - name: agent
-        image: busybox:1.36
+        image: mirror.gcr.io/library/busybox:1.36
         command: ["/bin/sh", "-c", "while true; do sleep 3600; done"]
         resources:
           requests:
@@ -99,7 +309,7 @@ spec:
       terminationGracePeriodSeconds: 2
       containers:
       - name: app
-        image: busybox:1.36
+        image: mirror.gcr.io/library/busybox:1.36
         command: ["/bin/sh", "-c", "while true; do sleep 3600; done"]
         resources:
           requests:
@@ -140,7 +350,7 @@ spec:
       terminationGracePeriodSeconds: 1
       containers:
       - name: crasher
-        image: busybox:1.36
+        image: mirror.gcr.io/library/busybox:1.36
         command: ["/bin/sh", "-c", "exit 1"]
         resources:
           requests:
@@ -163,7 +373,7 @@ spec:
   terminationGracePeriodSeconds: 2
   containers:
   - name: app
-    image: busybox:1.36
+    image: mirror.gcr.io/library/busybox:1.36
     command: ["/bin/sh", "-c", "while true; do sleep 3600; done"]
     resources:
       requests:
@@ -195,9 +405,9 @@ const (
 
 // Label selectors for raw-manifest workloads.
 const (
-	WorkerPodSelector         = "app=worker"
-	CrasherPodSelector        = "app=crasher"
-	StandalonePDBPodSelector  = "app=pdb-standalone"
+	WorkerPodSelector        = "app=worker"
+	CrasherPodSelector       = "app=crasher"
+	StandalonePDBPodSelector = "app=pdb-standalone"
 )
 
 // Resource names as created by the helm charts.

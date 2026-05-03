@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -46,7 +47,7 @@ func TestMain(m *testing.M) {
 }
 
 func runTests(m *testing.M) int {
-	ctx, cancel := context.WithTimeout(context.Background(), 28*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 33*time.Minute)
 	defer cancel()
 
 	// ── Build binary ──────────────────────────────────────────────────────────
@@ -83,6 +84,14 @@ func runTests(m *testing.M) int {
 		KubeconfigPath: testCluster.KubeconfigPath,
 	}
 
+	// ── Cluster baseline ──────────────────────────────────────────────────────
+	fmt.Fprintln(os.Stderr, "[e2e] Waiting for cluster addons to be ready...")
+	if err := framework.WaitForClusterAddons(ctx, client, 3*time.Minute); err != nil {
+		fmt.Fprintf(os.Stderr, "[e2e] cluster addons not ready: %v\n", err)
+		dumpSetupDiagnostics(testCluster.KubeconfigPath)
+		return 1
+	}
+
 	// ── Namespace ─────────────────────────────────────────────────────────────
 	if err := framework.EnsureNamespace(ctx, client, framework.E2ENamespace); err != nil {
 		fmt.Fprintf(os.Stderr, "[e2e] create namespace: %v\n", err)
@@ -106,6 +115,7 @@ func runTests(m *testing.M) int {
 		fmt.Fprintf(os.Stderr, "[e2e] Installing %s (%s)...\n", r.ReleaseName, r.Chart)
 		if err := framework.HelmInstall(ctx, testCluster.KubeconfigPath, r); err != nil {
 			fmt.Fprintf(os.Stderr, "[e2e] helm install %s: %v\n", r.ReleaseName, err)
+			dumpSetupDiagnostics(testCluster.KubeconfigPath)
 			return 1
 		}
 	}
@@ -114,9 +124,30 @@ func runTests(m *testing.M) int {
 	fmt.Fprintln(os.Stderr, "[e2e] Waiting for workloads to be ready...")
 	if err := framework.WaitForCoreWorkloads(ctx, client, framework.E2ENamespace, 5*time.Minute); err != nil {
 		fmt.Fprintf(os.Stderr, "[e2e] workloads not ready: %v\n", err)
+		dumpSetupDiagnostics(testCluster.KubeconfigPath)
 		return 1
 	}
 	fmt.Fprintln(os.Stderr, "[e2e] All workloads ready. Running tests.")
 
 	return m.Run()
+}
+
+func dumpSetupDiagnostics(kubeconfigPath string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dumpSetupKubectl(ctx, kubeconfigPath, "nodes", "get", "nodes", "-o", "wide")
+	dumpSetupKubectl(ctx, kubeconfigPath, "pods", "get", "pods", "-A", "-o", "wide")
+	dumpSetupKubectl(ctx, kubeconfigPath, "events", "get", "events", "-A", "--sort-by=.lastTimestamp")
+}
+
+func dumpSetupKubectl(ctx context.Context, kubeconfigPath, label string, args ...string) {
+	allArgs := append([]string{"--kubeconfig", kubeconfigPath}, args...)
+	cmd := exec.CommandContext(ctx, "kubectl", allArgs...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[e2e] diagnostics kubectl %s failed: %v\n%s\n", label, err, out)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[e2e] diagnostics kubectl %s:\n%s\n", label, out)
 }

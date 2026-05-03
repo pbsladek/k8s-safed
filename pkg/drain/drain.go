@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -102,9 +103,13 @@ type Options struct {
 	// interrupted drain to be continued without redundant rolling restarts.
 	Resume bool
 	// CheckpointPath is the local file path used to persist drain progress.
-	// When empty and Resume is true, the path is derived from the kubeconfig
-	// context and node name. Ignored when Resume is false.
+	// When empty at the CLI layer, the path is derived from the kubeconfig
+	// context and node name. Progress is written for non-dry-run drains and the
+	// file is deleted after a successful drain.
 	CheckpointPath string
+	// CheckpointContext is the kubeconfig context used for checkpoint metadata
+	// and resume validation. It may be empty when the context cannot be resolved.
+	CheckpointContext string
 }
 
 // Drainer orchestrates the safe drain sequence.
@@ -269,7 +274,7 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 	}
 
 	// Delete the checkpoint on successful completion — it's no longer needed.
-	if d.opts.CheckpointPath != "" {
+	if d.opts.CheckpointPath != "" && !d.opts.DryRun {
 		if err := DeleteCheckpoint(d.opts.CheckpointPath); err != nil {
 			out.Warnf(d.opts.NodeName, "failed to remove checkpoint: %v", err)
 		}
@@ -343,6 +348,9 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 		if err != nil {
 			return fmt.Errorf("loading checkpoint: %w", err)
 		}
+		if err := d.validateCheckpoint(cp); err != nil {
+			return err
+		}
 		remaining := workloads[:0:0]
 		for _, w := range workloads {
 			if cp.IsDone(w) {
@@ -360,12 +368,19 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 	if cp == nil {
 		cp = &Checkpoint{Completed: make(map[string]bool)}
 	}
+	cp.NodeName = d.opts.NodeName
+	cp.Context = d.opts.CheckpointContext
 
 	// saveCP persists the checkpoint after each successful workload (best-effort).
+	var cpMu sync.Mutex
 	saveCP := func(w workload.Workload) {
-		if d.opts.CheckpointPath == "" {
+		if d.opts.CheckpointPath == "" || d.opts.DryRun {
 			return
 		}
+		cpMu.Lock()
+		defer cpMu.Unlock()
+		cp.NodeName = d.opts.NodeName
+		cp.Context = d.opts.CheckpointContext
 		cp.MarkDone(w)
 		if err := cp.Save(d.opts.CheckpointPath); err != nil {
 			d.opts.Out.Warnf(d.opts.NodeName, "failed to save checkpoint: %v", err)
@@ -403,13 +418,13 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 		batchNum := batchStart/maxC + 1
 
 		if totalBatches > 1 {
-			out.Infof(d.opts.NodeName,"batch %d/%d: starting %d workload(s) concurrently",
+			out.Infof(d.opts.NodeName, "batch %d/%d: starting %d workload(s) concurrently",
 				batchNum, totalBatches, len(batch))
 		} else {
-			out.Infof(d.opts.NodeName,"Starting all %d workload(s) concurrently", len(batch))
+			out.Infof(d.opts.NodeName, "Starting all %d workload(s) concurrently", len(batch))
 		}
 		for _, w := range batch {
-			out.Infof(d.opts.NodeName,"  · %s", w)
+			out.Infof(d.opts.NodeName, "  · %s", w)
 		}
 
 		g, gctx := errgroup.WithContext(ctx)
@@ -421,6 +436,7 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 				if err := d.rollingRestart(gctx, w); err != nil {
 					return err
 				}
+				saveCP(w)
 				if !d.opts.DryRun {
 					out.Elapsed(t0, wSubject(w), "Complete")
 				}
@@ -431,15 +447,20 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 			return err
 		}
 
-		// Save checkpoint for all workloads in the completed batch.
-		for _, w := range batch {
-			saveCP(w)
-		}
-
 		if totalBatches > 1 {
 			out.Infof(d.opts.NodeName, "batch %d/%d: all %d workload(s) complete",
 				batchNum, totalBatches, len(batch))
 		}
+	}
+	return nil
+}
+
+func (d *Drainer) validateCheckpoint(cp *Checkpoint) error {
+	if cp.NodeName != "" && cp.NodeName != d.opts.NodeName {
+		return fmt.Errorf("checkpoint is for node %q, not %q", cp.NodeName, d.opts.NodeName)
+	}
+	if cp.Context != "" && d.opts.CheckpointContext != "" && cp.Context != d.opts.CheckpointContext {
+		return fmt.Errorf("checkpoint is for kube context %q, not %q", cp.Context, d.opts.CheckpointContext)
 	}
 	return nil
 }
@@ -454,19 +475,19 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 func (d *Drainer) cordon(ctx context.Context, node *corev1.Node) (cordonedByUs bool, err error) {
 	out := d.opts.Out
 	if node.Spec.Unschedulable {
-		out.Info(d.opts.NodeName,"Already cordoned")
+		out.Info(d.opts.NodeName, "Already cordoned")
 		if d.opts.UncordonOnFailure {
-			out.Info(d.opts.NodeName,"NOTE: --uncordon-on-failure has no effect (node was already cordoned before this drain)")
+			out.Info(d.opts.NodeName, "NOTE: --uncordon-on-failure has no effect (node was already cordoned before this drain)")
 		}
 		return false, nil
 	}
 
 	if d.opts.DryRun {
-		out.DryRunf(d.opts.NodeName,"Would cordon %q", d.opts.NodeName)
+		out.DryRunf(d.opts.NodeName, "Would cordon %q", d.opts.NodeName)
 		return false, nil
 	}
 
-	out.Infof(d.opts.NodeName,"Cordoning %q...", d.opts.NodeName)
+	out.Infof(d.opts.NodeName, "Cordoning %q...", d.opts.NodeName)
 	patch := []byte(`{"spec":{"unschedulable":true}}`)
 	_, err = d.client.CoreV1().Nodes().Patch(
 		ctx, d.opts.NodeName,
@@ -476,7 +497,7 @@ func (d *Drainer) cordon(ctx context.Context, node *corev1.Node) (cordonedByUs b
 	if err != nil {
 		return false, fmt.Errorf("cordoning node %q: %w", d.opts.NodeName, err)
 	}
-	out.Donef(d.opts.NodeName,"Cordoned %q", d.opts.NodeName)
+	out.Donef(d.opts.NodeName, "Cordoned %q", d.opts.NodeName)
 	return true, nil
 }
 
@@ -493,10 +514,10 @@ func (d *Drainer) uncordon(out *Printer) {
 		metav1.PatchOptions{},
 	)
 	if err != nil {
-		out.Infof(d.opts.NodeName,"WARNING: failed to uncordon %q after drain failure: %v", d.opts.NodeName, err)
+		out.Infof(d.opts.NodeName, "WARNING: failed to uncordon %q after drain failure: %v", d.opts.NodeName, err)
 		return
 	}
-	out.Donef(d.opts.NodeName,"Uncordoned %q (drain failed, --uncordon-on-failure is set)", d.opts.NodeName)
+	out.Donef(d.opts.NodeName, "Uncordoned %q (drain failed, --uncordon-on-failure is set)", d.opts.NodeName)
 }
 
 // rollingRestart triggers a rolling restart for w, waits for the rollout to
@@ -1050,16 +1071,27 @@ func (d *Drainer) evictRemaining(ctx context.Context) error {
 		return fmt.Errorf("listing remaining pods on %q: %w", d.opts.NodeName, err)
 	}
 
+	blocked := blockedEvictionPods(pods.Items, d.opts.SkipDaemonSets, d.opts.Force, d.opts.DeleteEmptyDir)
+	if len(blocked) > 0 {
+		for _, b := range blocked {
+			out.Warnf(d.opts.NodeName, "Cannot evict %s/%s: %s", b.pod.Namespace, b.pod.Name, b.reason)
+		}
+		if !d.opts.DryRun {
+			first := blocked[0]
+			return fmt.Errorf("remaining pod %s/%s cannot be evicted: %s", first.pod.Namespace, first.pod.Name, first.reason)
+		}
+	}
+
 	evictable := filterEvictable(pods.Items, d.opts.SkipDaemonSets, d.opts.Force, d.opts.DeleteEmptyDir)
 	if len(evictable) == 0 {
-		out.Infof(d.opts.NodeName,"No remaining pods to evict on %q", d.opts.NodeName)
+		out.Infof(d.opts.NodeName, "No remaining pods to evict on %q", d.opts.NodeName)
 		return nil
 	}
 
-	out.Infof(d.opts.NodeName,"Evicting %d remaining pod(s) on %q:", len(evictable), d.opts.NodeName)
+	out.Infof(d.opts.NodeName, "Evicting %d remaining pod(s) on %q:", len(evictable), d.opts.NodeName)
 	for i := range evictable {
 		pod := &evictable[i]
-		out.Infof(d.opts.NodeName,"  · %s/%s [owner: %s]", pod.Namespace, pod.Name, podOwnerKind(pod))
+		out.Infof(d.opts.NodeName, "  · %s/%s [owner: %s]", pod.Namespace, pod.Name, podOwnerKind(pod))
 	}
 
 	for i := range evictable {
@@ -1185,6 +1217,38 @@ func filterEvictable(pods []corev1.Pod, skipDaemonSets, force, deleteEmptyDir bo
 		}
 
 		out = append(out, *pod)
+	}
+	return out
+}
+
+type blockedEvictionPod struct {
+	pod    corev1.Pod
+	reason string
+}
+
+func blockedEvictionPods(pods []corev1.Pod, skipDaemonSets, force, deleteEmptyDir bool) []blockedEvictionPod {
+	var out []blockedEvictionPod
+	for i := range pods {
+		pod := &pods[i]
+
+		if pod.DeletionTimestamp != nil || workload.IsTerminalPod(pod) || isMirrorPod(pod) {
+			continue
+		}
+		if isDaemonSetPod(pod) && skipDaemonSets {
+			continue
+		}
+		if len(pod.OwnerReferences) == 0 && !force {
+			out = append(out, blockedEvictionPod{pod: *pod, reason: "standalone pods require --force"})
+			continue
+		}
+		if isJobPod(pod) && !force {
+			out = append(out, blockedEvictionPod{pod: *pod, reason: "Job-owned pods require --force"})
+			continue
+		}
+		if hasEmptyDir(pod) && !deleteEmptyDir && !force {
+			out = append(out, blockedEvictionPod{pod: *pod, reason: "emptyDir pods require --delete-emptydir-data or --force"})
+			continue
+		}
 	}
 	return out
 }

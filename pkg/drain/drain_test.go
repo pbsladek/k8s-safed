@@ -42,7 +42,6 @@ func ownerRef(kind, name string) metav1.OwnerReference {
 	return metav1.OwnerReference{Kind: kind, Name: name}
 }
 
-
 func readyNode(name string) corev1.Node {
 	return corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
@@ -239,6 +238,106 @@ func TestFilterEvictable(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBlockedEvictionPods(t *testing.T) {
+	standalonePod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "standalone", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	jobPod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "job-pod",
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{ownerRef("Job", "batch")},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	emptyDirPod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "emptydir",
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{ownerRef("ReplicaSet", "rs1")},
+		},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name:         "tmp",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	tests := []struct {
+		name           string
+		pods           []corev1.Pod
+		force          bool
+		deleteEmptyDir bool
+		wantCount      int
+		wantReason     string
+	}{
+		{
+			name:       "standalone pod requires force",
+			pods:       []corev1.Pod{standalonePod},
+			wantCount:  1,
+			wantReason: "standalone pods require --force",
+		},
+		{
+			name:       "Job pod requires force",
+			pods:       []corev1.Pod{jobPod},
+			wantCount:  1,
+			wantReason: "Job-owned pods require --force",
+		},
+		{
+			name:       "emptyDir pod requires explicit data deletion",
+			pods:       []corev1.Pod{emptyDirPod},
+			wantCount:  1,
+			wantReason: "emptyDir pods require --delete-emptydir-data or --force",
+		},
+		{
+			name:      "force allows unmanaged pods",
+			pods:      []corev1.Pod{standalonePod, jobPod, emptyDirPod},
+			force:     true,
+			wantCount: 0,
+		},
+		{
+			name:           "delete-emptydir-data allows ReplicaSet emptyDir pod",
+			pods:           []corev1.Pod{emptyDirPod},
+			deleteEmptyDir: true,
+			wantCount:      0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := blockedEvictionPods(tc.pods, true, tc.force, tc.deleteEmptyDir)
+			if len(got) != tc.wantCount {
+				t.Fatalf("got %d blocked pods, want %d", len(got), tc.wantCount)
+			}
+			if tc.wantReason != "" && got[0].reason != tc.wantReason {
+				t.Fatalf("reason = %q, want %q", got[0].reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestEvictRemaining_DryRunWarnsButDoesNotFailOnBlockedPods(t *testing.T) {
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "standalone",
+			Namespace: "default",
+		},
+		Spec:   corev1.PodSpec{NodeName: "node1"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	fakeCS := fake.NewClientset(&pod)
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.DryRun = true
+	})
+
+	if err := d.evictRemaining(t.Context()); err != nil {
+		t.Fatalf("dry-run should not fail on blocked remaining pods: %v", err)
 	}
 }
 

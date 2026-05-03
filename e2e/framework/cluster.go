@@ -15,6 +15,9 @@ const (
 	// DefaultClusterName is the k3d cluster name used for local e2e runs.
 	// Override with SAFED_E2E_CLUSTER_NAME for CI isolation.
 	DefaultClusterName = "safed-e2e"
+	// DefaultFlannelBackend avoids VXLAN flakiness in Docker-backed CI
+	// networks while keeping the default k3s CNI.
+	DefaultFlannelBackend = "host-gw"
 	// E2ENamespace is the namespace where test workloads are deployed.
 	E2ENamespace = "e2e"
 )
@@ -56,6 +59,13 @@ func (c *Cluster) Create(ctx context.Context) error {
 		"--k3s-arg", "--disable=metrics-server@server:*",
 		// No load-balancer port mapping needed for these tests.
 		"--no-lb",
+	}
+	flannelBackend := DefaultFlannelBackend
+	if backend := os.Getenv("SAFED_E2E_FLANNEL_BACKEND"); backend != "" {
+		flannelBackend = backend
+	}
+	if flannelBackend != "" {
+		args = append(args, "--k3s-arg", "--flannel-backend="+flannelBackend+"@server:*")
 	}
 	// Allow CI to pin a specific k3s image via K3S_IMAGE env var.
 	if img := os.Getenv("K3S_IMAGE"); img != "" {

@@ -1,0 +1,41 @@
+profiles:
+  prod:
+    preflight: strict
+    rollout-timeout: 10m
+    pod-vacate-timeout: 3m
+    eviction-timeout: 5m
+    pdb-retry-interval: 5s
+    poll-interval: 5s
+    timeout: 45m
+    max-concurrency: 1
+    node-concurrency: 1
+    uncordon-on-failure: true
+    emit-events: true
+
+  staging:
+    preflight: warn
+    rollout-timeout: 5m
+    pod-vacate-timeout: 2m
+    timeout: 25m
+    max-concurrency: 3
+    uncordon-on-failure: true
+    emit-events: true
+
+  spot-scale-down:
+    preflight: off
+    rollout-timeout: 6m
+    pod-vacate-timeout: 2m
+    eviction-timeout: 2m
+    node-concurrency: 5
+    max-concurrency: 2
+    delete-emptydir-data: true
+    uncordon-on-failure: true
+
+  audit-json:
+    preflight: strict
+    rollout-timeout: 10m
+    timeout: 45m
+    log-format: json
+    emit-events: true
+    uncordon-on-failure: true
+

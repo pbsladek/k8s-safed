@@ -6,6 +6,9 @@
 A `kubectl` krew plugin for draining Kubernetes nodes using rolling restarts
 rather than direct pod eviction.
 
+Full documentation, real-world command patterns, and reusable manifests live in
+[docs/](docs/).
+
 Instead of evicting pods — which can violate PodDisruptionBudgets and
 terminate traffic-serving containers before replacements are ready —
 `kubectl-safed` cordons the node and triggers rolling restarts on every
@@ -266,7 +269,7 @@ kubectl safed drain worker-1 --context=prod-cluster
 | Flag | Short | Default | Description |
 |---|---|---|---|
 | `--selector` | `-l` | | Label selector to target nodes (e.g. `node-pool=spot`). Mutually exclusive with positional node names. |
-| `--node-concurrency` | | `1` | Number of nodes to drain in parallel. `1` = sequential. |
+| `--node-concurrency` | | `1` | Number of nodes to drain in parallel. `1` = sequential, `0` = all targeted nodes at once. |
 
 #### Core behaviour
 
@@ -285,7 +288,7 @@ kubectl safed drain worker-1 --context=prod-cluster
 | `--only-workload` | | | Restrict rolling restarts to these workloads only (`Kind/namespace/name`). Repeatable. Mutually exclusive with `--skip-workload`. |
 | `--emit-events` | | `false` | Emit Kubernetes Events to node and workload objects. Requires `events/create` RBAC. Visible via `kubectl describe`. |
 | `--resume` | | `false` | Resume an interrupted drain, skipping workloads already recorded in the checkpoint file. |
-| `--checkpoint-path` | | | Override the checkpoint file path. Default: `~/.kube/safed-checkpoints/<context>-<node>.json`. |
+| `--checkpoint-path` | | | Override the checkpoint file path for a single-node drain. Default: `~/.kube/safed-checkpoints/<context>-<node>.json`. |
 | `--profile` | | | Load flag defaults from a named profile in the safed config file. CLI flags override profile values. |
 | `--config` | | | Path to the safed config file. Default: `~/.kube/safed.yaml`. Env: `KUBECTL_SAFED_CONFIG`. |
 
@@ -493,8 +496,10 @@ drain. On failure it is left in place for the next `--resume` run.
 In multi-node drains, each node has its own checkpoint file so resuming applies
 independently per node.
 
-Override the path with `--checkpoint-path` when needed (e.g. for scripted
-automation or when the home directory is not writable).
+Override the path with `--checkpoint-path` when needed for a single-node drain
+(e.g. for scripted automation or when the home directory is not writable).
+For multi-node drains, omit `--checkpoint-path` so each node uses its own
+context-and-node-specific checkpoint file.
 
 ---
 
@@ -599,10 +604,11 @@ make e2e
 make e2e-run TEST=TestDrain_NATS
 ```
 
-The suite covers 18 scenarios including StatefulSet and Deployment rolling
-restarts, multi-node drains, pre-flight checks, priority ordering, PDB-blocked
-eviction, CrashLoopBackOff fail-fast, `--uncordon-on-failure`, workload
-filtering, checkpoint and resume, and Kubernetes Event emission.
+The suite covers 30+ scenarios including StatefulSet and Deployment rolling
+restarts, multi-node drains, pre-flight checks, priority and batch ordering,
+PDB-blocked and PDB-allowed eviction, CrashLoopBackOff and ImagePullBackOff
+fail-fast, `--uncordon-on-failure`, workload filtering, checkpoint and resume,
+profile overrides, JSON logs, option validation, and Kubernetes Event emission.
 
 E2E tests run automatically in CI on every push and pull request to `main`,
 nightly at 03:00 UTC, and on `workflow_dispatch`.
