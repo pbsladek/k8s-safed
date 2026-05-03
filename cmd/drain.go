@@ -149,6 +149,17 @@ Examples:
 
 func runDrain(cmd *cobra.Command, nodeArgs []string, opts *drainOptions) error {
 	ctx := cmd.Context()
+
+	// Apply profile defaults for any flags that were not explicitly set by the user.
+	if opts.profile != "" {
+		if err := applyProfile(cmd, opts); err != nil {
+			return err
+		}
+	}
+	if err := validateDrainOptions(opts); err != nil {
+		return err
+	}
+
 	client, err := k8s.NewClient(kubeConfigFlags)
 	if err != nil {
 		return fmt.Errorf("failed to create Kubernetes client: %w", err)
@@ -158,27 +169,23 @@ func runDrain(cmd *cobra.Command, nodeArgs []string, opts *drainOptions) error {
 	if err != nil {
 		return err
 	}
-
-	// Apply profile defaults for any flags that were not explicitly set by the user.
-	if opts.profile != "" {
-		if err := applyProfile(cmd, opts); err != nil {
-			return err
-		}
+	if err := validateDrainTargets(opts, nodes); err != nil {
+		return err
 	}
 
 	// --force-delete-standalone implies --force (standalone pods require force).
 	force := opts.force || opts.forceDeleteStandalone
 
+	kubeCtx, err := effectiveKubeContext()
+	if err != nil {
+		return fmt.Errorf("resolving kube context: %w", err)
+	}
+
 	out := drain.NewPrinterWithFormat(os.Stdout, drain.LogFormat(opts.logFormat))
 
 	drainNode := func(ctx context.Context, nodeName string) error {
-		// Resolve per-node checkpoint path when --resume is set.
 		cpPath := opts.checkpointPath
-		if opts.resume && cpPath == "" {
-			kubeCtx := ""
-			if kubeConfigFlags.Context != nil {
-				kubeCtx = *kubeConfigFlags.Context
-			}
+		if cpPath == "" {
 			var err error
 			cpPath, err = drain.CheckpointPath(kubeCtx, nodeName)
 			if err != nil {
@@ -210,6 +217,7 @@ func runDrain(cmd *cobra.Command, nodeArgs []string, opts *drainOptions) error {
 			EmitEvents:            opts.emitEvents,
 			Resume:                opts.resume,
 			CheckpointPath:        cpPath,
+			CheckpointContext:     kubeCtx,
 		})
 		return drainer.Run(ctx)
 	}
@@ -248,6 +256,56 @@ func runDrain(cmd *cobra.Command, nodeArgs []string, opts *drainOptions) error {
 			return err
 		}
 	}
+	return nil
+}
+
+func validateDrainTargets(opts *drainOptions, nodes []string) error {
+	if opts.checkpointPath != "" && len(nodes) > 1 {
+		return fmt.Errorf("--checkpoint-path can only be used when draining a single node; omit it for per-node default checkpoints")
+	}
+	return nil
+}
+
+func validateDrainOptions(opts *drainOptions) error {
+	switch drain.PreflightMode(opts.preflight) {
+	case drain.PreflightModeWarn, drain.PreflightModeStrict, drain.PreflightModeOff:
+	default:
+		return fmt.Errorf("invalid --preflight %q (must be one of: warn, strict, off)", opts.preflight)
+	}
+
+	switch drain.LogFormat(opts.logFormat) {
+	case drain.LogFormatPlain, drain.LogFormatJSON:
+	default:
+		return fmt.Errorf("invalid --log-format %q (must be one of: plain, json)", opts.logFormat)
+	}
+
+	if opts.maxConcurrency < 0 {
+		return fmt.Errorf("--max-concurrency must be >= 0")
+	}
+	if opts.nodeConcurrency < 0 {
+		return fmt.Errorf("--node-concurrency must be >= 0")
+	}
+	if opts.gracePeriod < -1 {
+		return fmt.Errorf("--grace-period must be -1 or >= 0")
+	}
+
+	durationChecks := []struct {
+		name  string
+		value time.Duration
+	}{
+		{"--timeout", opts.timeout},
+		{"--rollout-timeout", opts.rolloutTimeout},
+		{"--pod-vacate-timeout", opts.podVacateTimeout},
+		{"--eviction-timeout", opts.evictionTimeout},
+		{"--pdb-retry-interval", opts.pdbRetryInterval},
+		{"--poll-interval", opts.pollInterval},
+	}
+	for _, check := range durationChecks {
+		if check.value < 0 {
+			return fmt.Errorf("%s must be >= 0", check.name)
+		}
+	}
+
 	return nil
 }
 
@@ -307,6 +365,21 @@ func isTransientCmdError(err error) bool {
 		k8serrors.IsServerTimeout(err) ||
 		k8serrors.IsTimeout(err) ||
 		k8serrors.IsTooManyRequests(err)
+}
+
+// effectiveKubeContext returns the kubeconfig context that this command will
+// use. An explicit --context flag wins; otherwise use the current context from
+// the loaded kubeconfig so default checkpoint names don't collide across
+// clusters.
+func effectiveKubeContext() (string, error) {
+	if kubeConfigFlags.Context != nil && *kubeConfigFlags.Context != "" {
+		return *kubeConfigFlags.Context, nil
+	}
+	rawCfg, err := kubeConfigFlags.ToRawKubeConfigLoader().RawConfig()
+	if err != nil {
+		return "", err
+	}
+	return rawCfg.CurrentContext, nil
 }
 
 // applyProfile loads the named profile from the config file and applies its

@@ -80,7 +80,7 @@ pkg/
     printer.go                  structured stdout/JSON output (LogFormat)
     preflight.go                pre-flight checks + stateful service detection
     events.go                   Kubernetes Event emission
-    checkpoint.go               checkpoint read/write/delete for --resume
+    checkpoint.go               checkpoint read/write/delete for drain resume
   config/
     config.go                   safed.yaml profile loading
 e2e/
@@ -125,7 +125,7 @@ plugin.yaml                     krew manifest (auto-updated by release workflow)
       `CrashLoopBackOff` (after first exit), `ImagePullBackOff`, `ErrImagePull`
    e. Poll pods on node matching workload's label selector until none are
       active (excluding terminating + terminal) — bounded by `--pod-vacate-timeout`
-   f. Write completed workload to checkpoint file (if `--resume` path is set)
+   f. Write completed workload to checkpoint file (non-dry-run drains)
 9. `LIST` remaining pods → evict eligible ones with PDB-aware retry
 10. Delete checkpoint file on success; emit "Drained" event (if `--emit-events`)
 

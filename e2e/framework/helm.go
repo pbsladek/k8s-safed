@@ -16,6 +16,8 @@ type HelmRelease struct {
 	ReleaseName string
 	// Chart is the repo/chart reference (e.g. "nats/nats").
 	Chart string
+	// Version pins the chart version used by the e2e suite.
+	Version string
 	// Namespace to install into.
 	Namespace string
 	// ValuesYAML is an optional YAML values override written to a temp file.
@@ -26,9 +28,9 @@ type HelmRelease struct {
 
 // HelmRepos maps a repo name to its URL. Call HelmSetupRepos once in TestMain.
 var HelmRepos = map[string]string{
-	"nats":                   "https://nats-io.github.io/k8s/helm/charts/",
-	"grafana":                "https://grafana.github.io/helm-charts",
-	"prometheus-community":   "https://prometheus-community.github.io/helm-charts",
+	"nats":                 "https://nats-io.github.io/k8s/helm/charts/",
+	"grafana":              "https://grafana.github.io/helm-charts",
+	"prometheus-community": "https://prometheus-community.github.io/helm-charts",
 }
 
 // HelmSetupRepos adds required helm repos and updates them.
@@ -63,6 +65,9 @@ func HelmInstall(ctx context.Context, kubeconfigPath string, r HelmRelease) erro
 		"--create-namespace",
 		"--wait",
 		"--timeout", timeout.String(),
+	}
+	if r.Version != "" {
+		args = append(args, "--version", r.Version)
 	}
 
 	// Write values to a temp file if provided.
@@ -113,8 +118,9 @@ func NATSRelease(ns string) HelmRelease {
 	return HelmRelease{
 		ReleaseName: "nats",
 		Chart:       "nats/nats",
+		Version:     "2.12.6",
 		Namespace:   ns,
-		Timeout:     5 * time.Minute,
+		Timeout:     8 * time.Minute,
 		ValuesYAML: `
 config:
   cluster:
@@ -130,6 +136,8 @@ statefulSet:
       maxSkew: 1
       whenUnsatisfiable: ScheduleAnyway
 container:
+  image:
+    fullImageName: mirror.gcr.io/library/nats:2.12.6-alpine
   merge:
     resources:
       requests:
@@ -137,6 +145,8 @@ container:
         memory: 64Mi
       limits:
         memory: 128Mi
+reloader:
+  enabled: false
 natsBox:
   enabled: false
 `,
@@ -149,12 +159,16 @@ func GrafanaRelease(ns string) HelmRelease {
 	return HelmRelease{
 		ReleaseName: "grafana",
 		Chart:       "grafana/grafana",
+		Version:     "10.5.15",
 		Namespace:   ns,
-		Timeout:     5 * time.Minute,
+		Timeout:     8 * time.Minute,
 		ValuesYAML: `
 replicas: 3
 annotations:
   kubectl.safed.io/drain-priority: "100"
+image:
+  registry: mirror.gcr.io
+  repository: grafana/grafana
 topologySpreadConstraints:
   - maxSkew: 1
     topologyKey: kubernetes.io/hostname
@@ -182,8 +196,9 @@ func KubeStateMetricsRelease(ns string) HelmRelease {
 	return HelmRelease{
 		ReleaseName: "kube-state-metrics",
 		Chart:       "prometheus-community/kube-state-metrics",
+		Version:     "7.3.0",
 		Namespace:   ns,
-		Timeout:     3 * time.Minute,
+		Timeout:     5 * time.Minute,
 		ValuesYAML: `
 resources:
   requests:
