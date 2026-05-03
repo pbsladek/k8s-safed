@@ -84,6 +84,14 @@ func runTests(m *testing.M) int {
 		KubeconfigPath: testCluster.KubeconfigPath,
 	}
 
+	// ── Cluster baseline ──────────────────────────────────────────────────────
+	fmt.Fprintln(os.Stderr, "[e2e] Waiting for cluster addons to be ready...")
+	if err := framework.WaitForClusterAddons(ctx, client, 3*time.Minute); err != nil {
+		fmt.Fprintf(os.Stderr, "[e2e] cluster addons not ready: %v\n", err)
+		dumpSetupDiagnostics(testCluster.KubeconfigPath)
+		return 1
+	}
+
 	// ── Namespace ─────────────────────────────────────────────────────────────
 	if err := framework.EnsureNamespace(ctx, client, framework.E2ENamespace); err != nil {
 		fmt.Fprintf(os.Stderr, "[e2e] create namespace: %v\n", err)

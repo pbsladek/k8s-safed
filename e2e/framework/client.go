@@ -38,6 +38,24 @@ func EnsureNamespace(ctx context.Context, client kubernetes.Interface, name stri
 	return nil
 }
 
+// WaitForClusterAddons waits for the built-in k3s addons that prove pod
+// networking and dynamic local storage are usable before test charts install.
+func WaitForClusterAddons(ctx context.Context, client kubernetes.Interface, timeout time.Duration) error {
+	addons := []struct {
+		namespace string
+		name      string
+	}{
+		{namespace: "kube-system", name: "coredns"},
+		{namespace: "kube-system", name: "local-path-provisioner"},
+	}
+	for _, addon := range addons {
+		if err := WaitForDeploymentReady(ctx, client, addon.namespace, addon.name, timeout); err != nil {
+			return fmt.Errorf("cluster addon %s/%s not ready: %w", addon.namespace, addon.name, err)
+		}
+	}
+	return nil
+}
+
 // NodeHasActivePods returns true if there are non-DaemonSet, non-terminal,
 // non-mirror pods in ns on nodeName.
 func NodeHasActivePods(ctx context.Context, client kubernetes.Interface, nodeName, ns string) (bool, error) {
