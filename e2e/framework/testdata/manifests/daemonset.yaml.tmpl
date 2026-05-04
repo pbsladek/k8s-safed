@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ .Name }}
+  namespace: {{ .Namespace }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .App }}
+  template:
+    metadata:
+      labels:
+        app: {{ .App }}
+    spec:
+      terminationGracePeriodSeconds: 2
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: agent
+        image: {{ .Image }}
+        command: ["/bin/sh", "-c", {{ printf "%q" .Command }}]
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi

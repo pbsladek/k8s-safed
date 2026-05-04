@@ -69,9 +69,12 @@ func writeConfig(t *testing.T, content string) string {
 
 func TestLoad_ValidConfig(t *testing.T) {
 	path := writeConfig(t, `
+defaults:
+  preflight: strict
+  stateful-name-patterns:
+    - ledger
 profiles:
   prod:
-    preflight: strict
     rollout-timeout: 10m
     max-concurrency: 1
     uncordon-on-failure: true
@@ -86,10 +89,13 @@ profiles:
 	if len(cfg.Profiles) != 2 {
 		t.Fatalf("expected 2 profiles, got %d", len(cfg.Profiles))
 	}
-	prod := cfg.Profiles["prod"]
-	if prod.Preflight != "strict" {
-		t.Errorf("prod.Preflight = %q, want %q", prod.Preflight, "strict")
+	if cfg.Defaults.Preflight != "strict" {
+		t.Errorf("defaults.Preflight = %q, want strict", cfg.Defaults.Preflight)
 	}
+	if len(cfg.Defaults.StatefulNamePatterns) != 1 || cfg.Defaults.StatefulNamePatterns[0] != "ledger" {
+		t.Errorf("defaults.StatefulNamePatterns = %#v, want [ledger]", cfg.Defaults.StatefulNamePatterns)
+	}
+	prod := cfg.Profiles["prod"]
 	if prod.RolloutTimeout == nil || prod.RolloutTimeout.D != 10*time.Minute {
 		t.Errorf("prod.RolloutTimeout = %v, want 10m", prod.RolloutTimeout)
 	}
@@ -113,6 +119,18 @@ func TestLoad_InvalidYAML_ReturnsError(t *testing.T) {
 	_, err := Load(path)
 	if err == nil {
 		t.Error("expected error for invalid YAML, got nil")
+	}
+}
+
+func TestLoad_UnknownField_ReturnsError(t *testing.T) {
+	path := writeConfig(t, `
+defaults:
+  preflight: strict
+  typo-field: true
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Error("expected error for unknown config field, got nil")
 	}
 }
 

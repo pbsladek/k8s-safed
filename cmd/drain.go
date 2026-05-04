@@ -2,8 +2,11 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -43,6 +46,9 @@ type drainOptions struct {
 	// Profile support.
 	profile    string
 	configFile string
+	mode       string
+	// Organization/application conventions.
+	statefulNamePatterns []string
 	// Event emission.
 	emitEvents bool
 	// Checkpoint / resume.
@@ -137,6 +143,10 @@ Examples:
 		`Load flag defaults from a named profile in the safed config file (see --config). CLI flags override profile values.`)
 	cmd.Flags().StringVar(&opts.configFile, "config", "",
 		`Path to the safed config file (default: ~/.kube/safed.yaml; env: KUBECTL_SAFED_CONFIG)`)
+	cmd.Flags().StringVar(&opts.mode, "mode", "",
+		`Use a built-in drain mode: "prod", "scale-down", or "debug". CLI flags override mode values.`)
+	cmd.Flags().StringArrayVar(&opts.statefulNamePatterns, "stateful-name-pattern", nil,
+		`Add a custom pre-flight stateful workload name pattern. Repeatable. Also supported in config as stateful-name-patterns.`)
 	cmd.Flags().BoolVar(&opts.emitEvents, "emit-events", false,
 		"Emit Kubernetes Events to node and workload objects during drain (requires events/create RBAC permission)")
 	cmd.Flags().BoolVar(&opts.resume, "resume", false,
@@ -150,11 +160,10 @@ Examples:
 func runDrain(cmd *cobra.Command, nodeArgs []string, opts *drainOptions) error {
 	ctx := cmd.Context()
 
-	// Apply profile defaults for any flags that were not explicitly set by the user.
-	if opts.profile != "" {
-		if err := applyProfile(cmd, opts); err != nil {
-			return err
-		}
+	// Apply config defaults, built-in modes, and profile defaults for flags
+	// that were not explicitly set by the user.
+	if err := applyConfig(cmd, opts); err != nil {
+		return err
 	}
 	if err := validateDrainOptions(opts); err != nil {
 		return err
@@ -212,6 +221,7 @@ func runDrain(cmd *cobra.Command, nodeArgs []string, opts *drainOptions) error {
 			Out:                   out,
 			UncordonOnFailure:     opts.uncordonOnFailure,
 			Preflight:             drain.PreflightMode(opts.preflight),
+			StatefulNamePatterns:  opts.statefulNamePatterns,
 			SkipWorkloads:         sliceToSet(opts.skipWorkloads),
 			OnlyWorkloads:         sliceToSet(opts.onlyWorkloads),
 			EmitEvents:            opts.emitEvents,
@@ -382,14 +392,54 @@ func effectiveKubeContext() (string, error) {
 	return rawCfg.CurrentContext, nil
 }
 
-// applyProfile loads the named profile from the config file and applies its
-// values to opts for any flag that was not explicitly set on the command line.
-// CLI flags always take precedence over profile values.
-func applyProfile(cmd *cobra.Command, opts *drainOptions) error {
+var builtinDrainModes = map[string]config.Profile{
+	"prod": {
+		Preflight:         string(drain.PreflightModeStrict),
+		Timeout:           durationPtr(45 * time.Minute),
+		MaxConcurrency:    intPtr(1),
+		NodeConcurrency:   intPtr(1),
+		UncordonOnFailure: boolPtr(true),
+		EmitEvents:        boolPtr(true),
+	},
+	"scale-down": {
+		Preflight:         string(drain.PreflightModeWarn),
+		RolloutTimeout:    durationPtr(6 * time.Minute),
+		PodVacateTimeout:  durationPtr(2 * time.Minute),
+		EvictionTimeout:   durationPtr(2 * time.Minute),
+		MaxConcurrency:    intPtr(2),
+		NodeConcurrency:   intPtr(5),
+		UncordonOnFailure: boolPtr(true),
+	},
+	"debug": {
+		Preflight:    string(drain.PreflightModeWarn),
+		DryRun:       boolPtr(true),
+		PollInterval: durationPtr(1 * time.Second),
+		Timeout:      durationPtr(10 * time.Minute),
+	},
+}
+
+func durationPtr(d time.Duration) *config.Duration { return &config.Duration{D: d} }
+func intPtr(v int) *int                            { return &v }
+func boolPtr(v bool) *bool                         { return &v }
+
+func builtinModeNames() []string {
+	names := make([]string, 0, len(builtinDrainModes))
+	for name := range builtinDrainModes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// applyConfig applies defaults in this order:
+// built-in flag defaults -> config defaults -> built-in mode -> named profile -> CLI flags.
+func applyConfig(cmd *cobra.Command, opts *drainOptions) error {
 	cfgPath := opts.configFile
+	explicitConfig := cfgPath != ""
 	if cfgPath == "" {
 		cfgPath = os.Getenv("KUBECTL_SAFED_CONFIG")
 	}
+	envConfig := cfgPath != "" && !explicitConfig
 	if cfgPath == "" {
 		var err error
 		cfgPath, err = config.DefaultConfigPath()
@@ -400,13 +450,40 @@ func applyProfile(cmd *cobra.Command, opts *drainOptions) error {
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		return err
+		if !errors.Is(err, os.ErrNotExist) || explicitConfig || envConfig || opts.profile != "" {
+			return err
+		}
+		cfg = nil
 	}
-	prof, err := cfg.GetProfile(opts.profile)
-	if err != nil {
-		return err
+	if cfg != nil {
+		applyProfileValues(cmd, opts, cfg.Defaults)
 	}
 
+	if opts.mode != "" {
+		mode, ok := builtinDrainModes[opts.mode]
+		if !ok {
+			return fmt.Errorf("invalid --mode %q (must be one of: %s)", opts.mode, strings.Join(builtinModeNames(), ", "))
+		}
+		applyProfileValues(cmd, opts, mode)
+	}
+
+	if opts.profile != "" {
+		if cfg == nil {
+			return fmt.Errorf("profile %q requested but config file %q was not loaded", opts.profile, cfgPath)
+		}
+		prof, err := cfg.GetProfile(opts.profile)
+		if err != nil {
+			return err
+		}
+		applyProfileValues(cmd, opts, prof)
+	}
+	return nil
+}
+
+// applyProfileValues applies profile-like values for any scalar flag that was
+// not explicitly set on the command line. Stateful name patterns are additive:
+// config defaults, modes, profiles, and CLI values all extend the built-in list.
+func applyProfileValues(cmd *cobra.Command, opts *drainOptions, prof config.Profile) {
 	changed := func(name string) bool { return cmd.Flags().Changed(name) }
 
 	if prof.Timeout != nil && !changed("timeout") {
@@ -460,5 +537,7 @@ func applyProfile(cmd *cobra.Command, opts *drainOptions) error {
 	if prof.EmitEvents != nil && !changed("emit-events") {
 		opts.emitEvents = *prof.EmitEvents
 	}
-	return nil
+	if len(prof.StatefulNamePatterns) > 0 {
+		opts.statefulNamePatterns = append(opts.statefulNamePatterns, prof.StatefulNamePatterns...)
+	}
 }

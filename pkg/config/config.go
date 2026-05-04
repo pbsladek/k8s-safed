@@ -5,9 +5,13 @@
 //
 // Example config file:
 //
+//	defaults:
+//	  preflight: strict
+//	  uncordon-on-failure: true
+//	  stateful-name-patterns:
+//	    - ledger
 //	profiles:
 //	  prod:
-//	    preflight: strict
 //	    rollout-timeout: 10m
 //	    max-concurrency: 1
 //	    uncordon-on-failure: true
@@ -22,6 +26,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -75,10 +80,12 @@ type Profile struct {
 	ForceDeleteStandalone *bool     `json:"force-delete-standalone,omitempty"`
 	UncordonOnFailure     *bool     `json:"uncordon-on-failure,omitempty"`
 	EmitEvents            *bool     `json:"emit-events,omitempty"`
+	StatefulNamePatterns  []string  `json:"stateful-name-patterns,omitempty"`
 }
 
 // Config is the top-level structure of the safed config file.
 type Config struct {
+	Defaults Profile            `json:"defaults,omitempty"`
 	Profiles map[string]Profile `json:"profiles,omitempty"`
 }
 
@@ -98,7 +105,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("reading config file %q: %w", path, err)
 	}
 	var cfg Config
-	if err := sigsyaml.Unmarshal(data, &cfg); err != nil {
+	if err := sigsyaml.UnmarshalStrict(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing config file %q: %w", path, err)
 	}
 	return &cfg, nil
@@ -112,6 +119,7 @@ func (c *Config) GetProfile(name string) (Profile, error) {
 		for k := range c.Profiles {
 			names = append(names, k)
 		}
+		sort.Strings(names)
 		return Profile{}, fmt.Errorf("profile %q not found (available: %s)", name, strings.Join(names, ", "))
 	}
 	return p, nil

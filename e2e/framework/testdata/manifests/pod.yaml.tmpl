@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ .Name }}
+  namespace: {{ .Namespace }}
+  labels:
+    app: {{ .App }}
+spec:
+  terminationGracePeriodSeconds: 2
+  containers:
+  - name: app
+    image: {{ .Image }}
+    command: ["/bin/sh", "-c", {{ printf "%q" .Command }}]
+{{ if .EmptyDir }}
+    volumeMounts:
+    - name: scratch
+      mountPath: /scratch
+{{ end }}
+    resources:
+      requests:
+        cpu: 10m
+        memory: 8Mi
+{{ if .EmptyDir }}
+  volumes:
+  - name: scratch
+    emptyDir: {}
+{{ end }}

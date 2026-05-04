@@ -1,9 +1,13 @@
 package cmd
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/spf13/cobra"
 )
 
 func TestValidateDrainOptions_Defaults(t *testing.T) {
@@ -178,4 +182,131 @@ func TestValidateDrainTargets_AllowsCustomCheckpointPathForSingleNode(t *testing
 	if err := validateDrainTargets(opts, []string{"node-a"}); err != nil {
 		t.Fatalf("single-node custom checkpoint should validate: %v", err)
 	}
+}
+
+func TestApplyConfig_DefaultsModeProfileOrder(t *testing.T) {
+	cfgPath := writeDrainConfig(t, `
+defaults:
+  preflight: warn
+  timeout: 20m
+  stateful-name-patterns:
+    - ledger
+profiles:
+  custom:
+    timeout: 30m
+    max-concurrency: 4
+    stateful-name-patterns:
+      - temporal
+`)
+	opts := defaultDrainOptionsForTest()
+	opts.configFile = cfgPath
+	opts.mode = "prod"
+	opts.profile = "custom"
+	cmd := drainCommandForConfigTest()
+
+	if err := applyConfig(cmd, opts); err != nil {
+		t.Fatalf("applyConfig: %v", err)
+	}
+
+	if opts.preflight != "strict" {
+		t.Errorf("preflight = %q, want strict from prod mode", opts.preflight)
+	}
+	if opts.timeout != 30*time.Minute {
+		t.Errorf("timeout = %v, want profile override 30m", opts.timeout)
+	}
+	if opts.maxConcurrency != 4 {
+		t.Errorf("maxConcurrency = %d, want profile override 4", opts.maxConcurrency)
+	}
+	if !opts.emitEvents {
+		t.Error("emitEvents should come from prod mode")
+	}
+	if got := strings.Join(opts.statefulNamePatterns, ","); got != "ledger,temporal" {
+		t.Errorf("statefulNamePatterns = %q, want ledger,temporal", got)
+	}
+}
+
+func TestApplyConfig_CLIOverridesConfigAndMode(t *testing.T) {
+	cfgPath := writeDrainConfig(t, `
+defaults:
+  preflight: strict
+profiles:
+  custom:
+    preflight: warn
+`)
+	opts := defaultDrainOptionsForTest()
+	opts.configFile = cfgPath
+	opts.mode = "prod"
+	opts.profile = "custom"
+	opts.preflight = "off"
+	cmd := drainCommandForConfigTest()
+	if err := cmd.Flags().Set("preflight", "off"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := applyConfig(cmd, opts); err != nil {
+		t.Fatalf("applyConfig: %v", err)
+	}
+	if opts.preflight != "off" {
+		t.Errorf("preflight = %q, want CLI override off", opts.preflight)
+	}
+}
+
+func TestApplyConfig_InvalidMode(t *testing.T) {
+	opts := defaultDrainOptionsForTest()
+	opts.mode = "unknown"
+	err := applyConfig(drainCommandForConfigTest(), opts)
+	if err == nil {
+		t.Fatal("expected invalid mode error")
+	}
+	if !strings.Contains(err.Error(), "invalid --mode") {
+		t.Fatalf("error = %q, want invalid --mode", err.Error())
+	}
+}
+
+func writeDrainConfig(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "safed.yaml")
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func defaultDrainOptionsForTest() *drainOptions {
+	return &drainOptions{
+		preflight:        "warn",
+		logFormat:        "plain",
+		maxConcurrency:   1,
+		nodeConcurrency:  1,
+		gracePeriod:      -1,
+		rolloutTimeout:   5 * time.Minute,
+		podVacateTimeout: 2 * time.Minute,
+		evictionTimeout:  5 * time.Minute,
+		pdbRetryInterval: 5 * time.Second,
+		pollInterval:     5 * time.Second,
+		skipDaemonSets:   true,
+	}
+}
+
+func drainCommandForConfigTest() *cobra.Command {
+	cmd := &cobra.Command{}
+	flags := cmd.Flags()
+	flags.Duration("timeout", 0, "")
+	flags.Duration("rollout-timeout", 0, "")
+	flags.Duration("pod-vacate-timeout", 0, "")
+	flags.Duration("eviction-timeout", 0, "")
+	flags.Duration("pdb-retry-interval", 0, "")
+	flags.Duration("poll-interval", 0, "")
+	flags.Int("max-concurrency", 1, "")
+	flags.Int("node-concurrency", 1, "")
+	flags.String("preflight", "warn", "")
+	flags.String("log-format", "plain", "")
+	flags.Bool("dry-run", false, "")
+	flags.Bool("force", false, "")
+	flags.Bool("ignore-daemonsets", true, "")
+	flags.Bool("delete-emptydir-data", false, "")
+	flags.Bool("force-delete-standalone", false, "")
+	flags.Bool("uncordon-on-failure", false, "")
+	flags.Bool("emit-events", false, "")
+	return cmd
 }

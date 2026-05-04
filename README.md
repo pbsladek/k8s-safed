@@ -255,6 +255,9 @@ kubectl safed drain worker-1 --resume
 # Use a named drain profile from ~/.kube/safed.yaml
 kubectl safed drain worker-1 --profile=prod
 
+# Use a built-in convention preset
+kubectl safed drain worker-1 --mode=prod
+
 # Emit Kubernetes Events for audit trail (visible via kubectl describe node)
 kubectl safed drain worker-1 --emit-events
 
@@ -277,6 +280,7 @@ kubectl safed drain worker-1 --context=prod-cluster
 |---|---|---|---|
 | `--dry-run` | `-d` | `false` | Preview all actions without making any changes. |
 | `--preflight` | | `warn` | Pre-flight mode: `warn` (log risks, continue), `strict` (abort on any risk), `off` (skip all checks). |
+| `--mode` | | | Built-in convention preset: `prod`, `scale-down`, or `debug`. CLI flags override mode values. |
 | `--force` | `-f` | `false` | Evict standalone pods (no owner) and Job-owned pods. |
 | `--force-delete-standalone` | | `false` | Force-delete standalone pods with `gracePeriodSeconds=0` instead of evicting. Implies `--force`. |
 | `--ignore-daemonsets` | | `true` | Skip eviction of DaemonSet-managed pods. |
@@ -291,6 +295,7 @@ kubectl safed drain worker-1 --context=prod-cluster
 | `--checkpoint-path` | | | Override the checkpoint file path for a single-node drain. Default: `~/.kube/safed-checkpoints/<context>-<node>.json`. |
 | `--profile` | | | Load flag defaults from a named profile in the safed config file. CLI flags override profile values. |
 | `--config` | | | Path to the safed config file. Default: `~/.kube/safed.yaml`. Env: `KUBECTL_SAFED_CONFIG`. |
+| `--stateful-name-pattern` | | | Add a custom pre-flight stateful workload name pattern. Repeatable. |
 
 #### Timeouts
 
@@ -356,6 +361,9 @@ Stateful service detection matches these patterns (case-insensitive substring):
 `rabbitmq`, `nats`,
 `etcd`, `cassandra`, `scylla`, `cockroach`, `clickhouse`, `yugabyte`,
 `minio`, `vault`, `memcached`
+
+Add local conventions with `stateful-name-patterns` in `~/.kube/safed.yaml`
+or repeat `--stateful-name-pattern`.
 
 ---
 
@@ -503,31 +511,41 @@ context-and-node-specific checkpoint file.
 
 ---
 
-## Drain profiles
+## Drain config, modes, and profiles
 
-Save common flag combinations in `~/.kube/safed.yaml` and reference them with
-`--profile`. CLI flags always override profile values.
+Save organization-wide conventions in `~/.kube/safed.yaml`. Top-level
+`defaults` apply automatically when the file exists. Built-in modes and named
+profiles layer on top of those defaults. CLI flags always override scalar
+values.
 
 ```yaml
+defaults:
+  preflight: strict
+  uncordon-on-failure: true
+  stateful-name-patterns:
+    - ledger
+    - temporal
+
 profiles:
   prod:
-    preflight: strict
-    rollout-timeout: 10m
-    max-concurrency: 1
-    uncordon-on-failure: true
+    timeout: 45m
     emit-events: true
   staging:
     preflight: warn
-    rollout-timeout: 3m
+    rollout-timeout: 5m
     max-concurrency: 3
   spot-scale-down:
-    preflight: off
-    ignore-daemonsets: false
     delete-emptydir-data: true
     node-concurrency: 5
 ```
 
 ```bash
+# Use organization defaults
+kubectl safed drain worker-1
+
+# Use a built-in convention preset
+kubectl safed drain worker-1 --mode=prod
+
 # Use the prod profile
 kubectl safed drain worker-1 --profile=prod
 
@@ -537,6 +555,8 @@ kubectl safed drain worker-1 --profile=prod --max-concurrency=3
 
 The config file path can be overridden with `--config` or the
 `KUBECTL_SAFED_CONFIG` environment variable.
+
+Built-in modes are `prod`, `scale-down`, and `debug`.
 
 ---
 
@@ -612,6 +632,14 @@ profile overrides, JSON logs, option validation, and Kubernetes Event emission.
 
 E2E tests run automatically in CI on every push and pull request to `main`,
 nightly at 03:00 UTC, and on `workflow_dispatch`.
+
+Useful e2e environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SAFED_E2E_CLUSTER_NAME` | `safed-e2e` | k3d cluster name. |
+| `SAFED_E2E_FLANNEL_BACKEND` | `host-gw` | k3s flannel backend. Set empty to use k3s default. |
+| `K3S_IMAGE` | | Optional k3s image passed to k3d. |
 
 ---
 

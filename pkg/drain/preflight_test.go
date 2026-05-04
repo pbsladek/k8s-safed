@@ -60,6 +60,15 @@ func TestMatchesStatefulPattern(t *testing.T) {
 	}
 }
 
+func TestMatchesStatefulPattern_CustomPatterns(t *testing.T) {
+	if got := matchesStatefulPattern("ledger-api", "ledger"); got != "ledger" {
+		t.Errorf("custom pattern match = %q, want ledger", got)
+	}
+	if got := matchesStatefulPattern("temporal-worker", "  TEMPORAL  "); got != "temporal" {
+		t.Errorf("trimmed custom pattern match = %q, want temporal", got)
+	}
+}
+
 // --------------------------------------------------------------------------
 // preflightDeployment
 // --------------------------------------------------------------------------

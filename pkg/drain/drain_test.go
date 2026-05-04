@@ -1,8 +1,10 @@
 package drain
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -715,6 +717,28 @@ func TestFilterWorkloads_SkipAll_ReturnsEmpty(t *testing.T) {
 	got := d.filterWorkloads(wls)
 	if len(got) != 0 {
 		t.Errorf("expected 0 workloads after skipping all, got %d", len(got))
+	}
+}
+
+func TestWarnInvalidPriorityAnnotations(t *testing.T) {
+	var buf bytes.Buffer
+	fakeCS := fake.NewClientset()
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.Out = NewPrinterTo(&buf)
+	})
+
+	d.warnInvalidPriorityAnnotations([]workload.Workload{{
+		Kind:                      workload.KindDeployment,
+		Namespace:                 "default",
+		Name:                      "api",
+		Priority:                  workload.DefaultDrainPriority,
+		PriorityAnnotationValue:   "bad",
+		PriorityAnnotationInvalid: true,
+	}})
+
+	out := buf.String()
+	if !strings.Contains(out, "invalid kubectl.safed.io/drain-priority=\"bad\"") {
+		t.Fatalf("expected invalid priority warning, got:\n%s", out)
 	}
 }
 

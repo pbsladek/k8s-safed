@@ -33,10 +33,10 @@ type preflightIssue struct {
 	risk bool
 }
 
-// knownStatefulPatterns is matched case-insensitively against workload names.
+// defaultStatefulPatterns is matched case-insensitively against workload names.
 // A match surfaces a note prompting the operator to verify replication health
 // before the drain proceeds.
-var knownStatefulPatterns = []string{
+var defaultStatefulPatterns = []string{
 	// PostgreSQL ecosystem
 	"postgres", "postgresql", "pgbouncer", "pgpool", "pgpool2", "patroni",
 	// MySQL ecosystem
@@ -102,7 +102,7 @@ func (d *Drainer) runPreflight(ctx context.Context, workloads []workload.Workloa
 		}
 
 		// Name-based stateful service detection — applies to all workload kinds.
-		if pattern := matchesStatefulPattern(w.Name); pattern != "" {
+		if pattern := matchesStatefulPattern(w.Name, d.opts.StatefulNamePatterns...); pattern != "" {
 			issues = append(issues, preflightIssue{
 				subject: wsubj,
 				message: fmt.Sprintf(
@@ -226,13 +226,19 @@ func (d *Drainer) preflightStatefulSet(ctx context.Context, w workload.Workload,
 	return issues, nil
 }
 
-// matchesStatefulPattern returns the first known pattern found (case-insensitive)
-// in name, or "" if none match.
-func matchesStatefulPattern(name string) string {
+// matchesStatefulPattern returns the first configured or known pattern found
+// case-insensitively in name, or "" if none match.
+func matchesStatefulPattern(name string, additional ...string) string {
 	lower := strings.ToLower(name)
-	for _, p := range knownStatefulPatterns {
-		if strings.Contains(lower, p) {
-			return p
+	for _, patterns := range [][]string{additional, defaultStatefulPatterns} {
+		for _, p := range patterns {
+			p = strings.TrimSpace(strings.ToLower(p))
+			if p == "" {
+				continue
+			}
+			if strings.Contains(lower, p) {
+				return p
+			}
 		}
 	}
 	return ""

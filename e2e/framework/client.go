@@ -1,14 +1,12 @@
-//go:build e2e
-
 package framework
 
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -32,7 +30,7 @@ func EnsureNamespace(ctx context.Context, client kubernetes.Interface, name stri
 	_, err := client.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 	}, metav1.CreateOptions{})
-	if err != nil && !strings.Contains(err.Error(), "already exists") {
+	if err != nil && !k8serrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create namespace %s: %w", name, err)
 	}
 	return nil

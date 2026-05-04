@@ -5,7 +5,6 @@ package e2e
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -340,9 +339,20 @@ func patchDeployment(t *testing.T, ctx context.Context, namespace, name string, 
 	}
 }
 
+func mustJSONPatch(t *testing.T, patch any) []byte {
+	t.Helper()
+	data, err := json.Marshal(patch)
+	if err != nil {
+		t.Fatalf("marshal patch: %v", err)
+	}
+	return data
+}
+
 func setDeploymentMinReadySeconds(t *testing.T, ctx context.Context, namespace, name string, seconds int32) {
 	t.Helper()
-	patchDeployment(t, ctx, namespace, name, []byte(fmt.Sprintf(`{"spec":{"minReadySeconds":%d}}`, seconds)))
+	patchDeployment(t, ctx, namespace, name, mustJSONPatch(t, map[string]any{
+		"spec": map[string]any{"minReadySeconds": seconds},
+	}))
 }
 
 func waitForCheckpointEntry(t *testing.T, path, key string, timeout time.Duration) *drainpkg.Checkpoint {
@@ -917,14 +927,22 @@ func TestDrain_NodeSelector(t *testing.T) {
 
 	// Label only the target node.
 	const labelKey = "safed-e2e-target"
-	patch := []byte(`{"metadata":{"labels":{"` + labelKey + `":"true"}}}`)
+	patch := mustJSONPatch(t, map[string]any{
+		"metadata": map[string]any{
+			"labels": map[string]string{labelKey: "true"},
+		},
+	})
 	if _, err := testClient.CoreV1().Nodes().Patch(
 		ctx, target, "application/merge-patch+json", patch, metav1.PatchOptions{},
 	); err != nil {
 		t.Fatalf("label node: %v", err)
 	}
 	defer func() {
-		removePatch := []byte(`{"metadata":{"labels":{"` + labelKey + `":null}}}`)
+		removePatch := mustJSONPatch(t, map[string]any{
+			"metadata": map[string]any{
+				"labels": map[string]any{labelKey: nil},
+			},
+		})
 		_, _ = testClient.CoreV1().Nodes().Patch(
 			context.Background(), target, "application/merge-patch+json",
 			removePatch, metav1.PatchOptions{},
@@ -1378,14 +1396,14 @@ func TestDrain_CheckpointResume(t *testing.T) {
 	deployDeploymentsOnNode(t, ctx, target, manifest, "resume-skip", "resume-run")
 
 	cpPath := filepath.Join(t.TempDir(), "checkpoint.json")
-	cpData := fmt.Sprintf(`{
-  "nodeName": %q,
-  "context": "",
-  "completed": {
-    "Deployment/e2e/resume-skip": true
-  }
-}`, target)
-	if err := os.WriteFile(cpPath, []byte(cpData), 0600); err != nil {
+	cpData := mustJSONPatch(t, drainpkg.Checkpoint{
+		NodeName: target,
+		Context:  "",
+		Completed: map[string]bool{
+			"Deployment/e2e/resume-skip": true,
+		},
+	})
+	if err := os.WriteFile(cpPath, cpData, 0600); err != nil {
 		t.Fatalf("write checkpoint: %v", err)
 	}
 
@@ -1895,20 +1913,18 @@ func TestDrain_ImagePullAbort(t *testing.T) {
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "imagepull-bad")
 
-	patchDeployment(t, ctx, framework.E2ENamespace, "imagepull-bad", []byte(`{
-  "spec": {
-    "template": {
-      "spec": {
-        "containers": [
-          {
-            "name": "app",
-            "image": "127.0.0.1:9/k8s-safed/missing:latest"
-          }
-        ]
-      }
-    }
-  }
-}`))
+	patchDeployment(t, ctx, framework.E2ENamespace, "imagepull-bad", mustJSONPatch(t, map[string]any{
+		"spec": map[string]any{
+			"template": map[string]any{
+				"spec": map[string]any{
+					"containers": []map[string]string{{
+						"name":  "app",
+						"image": "127.0.0.1:9/k8s-safed/missing:latest",
+					}},
+				},
+			},
+		},
+	}))
 
 	result := testBinary.Drain(ctx, target,
 		"--preflight", "off",

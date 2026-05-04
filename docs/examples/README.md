@@ -23,12 +23,9 @@ and automatic uncordon on failure.
 
 ```bash
 kubectl safed drain ip-10-0-12-34.ec2.internal \
-  --preflight=strict \
-  --rollout-timeout=10m \
-  --pod-vacate-timeout=3m \
+  --mode=prod \
   --timeout=45m \
-  --emit-events \
-  --uncordon-on-failure
+  --emit-events
 ```
 
 Use this when a single node needs kernel patching, disk replacement, or
@@ -42,9 +39,8 @@ sequential workload rollout inside each node.
 ```bash
 kubectl safed drain \
   --selector=nodepool=spot \
+  --mode=scale-down \
   --node-concurrency=2 \
-  --preflight=warn \
-  --rollout-timeout=8m \
   --timeout=30m
 ```
 
@@ -194,24 +190,24 @@ aggregation systems.
 Create `~/.kube/safed.yaml`:
 
 ```yaml
+defaults:
+  preflight: strict
+  uncordon-on-failure: true
+  stateful-name-patterns:
+    - ledger
+    - temporal
+
 profiles:
   prod:
-    preflight: strict
-    rollout-timeout: 10m
-    pod-vacate-timeout: 3m
     timeout: 45m
-    max-concurrency: 1
-    uncordon-on-failure: true
     emit-events: true
   staging:
     preflight: warn
     rollout-timeout: 5m
     max-concurrency: 3
-    uncordon-on-failure: true
   spot-scale-down:
-    preflight: off
-    rollout-timeout: 6m
     node-concurrency: 5
+    max-concurrency: 2
     delete-emptydir-data: true
 ```
 
@@ -219,11 +215,14 @@ Then run:
 
 ```bash
 kubectl safed drain worker-1 --profile=prod
+kubectl safed drain worker-1 --mode=prod
 kubectl safed drain --selector=nodepool=spot --profile=spot-scale-down
+kubectl safed drain --selector=nodepool=spot --mode=scale-down
 kubectl safed drain worker-1 --profile=prod --max-concurrency=2
 ```
 
-CLI flags override profile values.
+Config defaults apply automatically when the file exists. Built-in modes and
+profiles layer on top of those defaults, and CLI flags override scalar values.
 
 ## 12. Drain DaemonSet Pods As Part Of Node Shutdown
 

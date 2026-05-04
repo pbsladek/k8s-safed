@@ -359,6 +359,12 @@ func TestFinder_FindForNode_Priority_InvalidAnnotation_UsesDefault(t *testing.T)
 	if wls[0].Priority != workload.DefaultDrainPriority {
 		t.Errorf("invalid annotation should fall back to DefaultDrainPriority, got %d", wls[0].Priority)
 	}
+	if !wls[0].PriorityAnnotationInvalid {
+		t.Error("invalid annotation should be marked invalid")
+	}
+	if wls[0].PriorityAnnotationValue != "not-a-number" {
+		t.Errorf("PriorityAnnotationValue = %q, want not-a-number", wls[0].PriorityAnnotationValue)
+	}
 }
 
 func TestFinder_FindForNode_StatefulSet_Priority(t *testing.T) {

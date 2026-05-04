@@ -138,6 +138,7 @@ Notes:
 |---|---:|---|
 | `--dry-run`, `-d` | `false` | Preview actions without mutating the cluster. |
 | `--preflight` | `warn` | `warn`, `strict`, or `off`. Strict aborts before cordon on risk-level findings. |
+| `--mode` | | Built-in convention preset: `prod`, `scale-down`, or `debug`. CLI flags override mode values. |
 | `--force`, `-f` | `false` | Allow eviction of standalone and Job-owned pods. |
 | `--force-delete-standalone` | `false` | Delete standalone pods with `gracePeriodSeconds=0`; implies `--force`. |
 | `--ignore-daemonsets` | `true` | Skip DaemonSet-managed pods. Set to `false` to evict them. |
@@ -152,6 +153,7 @@ Notes:
 | `--checkpoint-path` | | Override checkpoint path for a single-node drain only. |
 | `--profile` | | Load defaults from a named profile in the safed config file. |
 | `--config` | `~/.kube/safed.yaml` | Config file path. Also controlled by `KUBECTL_SAFED_CONFIG`. |
+| `--stateful-name-pattern` | | Add a custom pre-flight stateful workload name pattern. Repeatable. |
 
 `--skip-workload` and `--only-workload` are mutually exclusive.
 
@@ -193,6 +195,8 @@ causes a non-zero exit before the node is cordoned.
 Known stateful-service matching is case-insensitive and includes names such as
 `postgres`, `mysql`, `redis`, `mongo`, `elasticsearch`, `kafka`, `rabbitmq`,
 `nats`, `etcd`, `cassandra`, `cockroach`, `minio`, `vault`, and `memcached`.
+Add organization-specific patterns with `stateful-name-patterns` in config or
+`--stateful-name-pattern`.
 
 ## Workload Ordering
 
@@ -267,30 +271,45 @@ checkpoint for a different node or context. In multi-node drains, omit
 
 Dry-runs do not write checkpoints.
 
-## Profiles
+## Config, Modes, And Profiles
 
-Profiles live in `~/.kube/safed.yaml` by default. `--config` or
-`KUBECTL_SAFED_CONFIG` can point to another file. CLI flags override profile
-values.
+Config lives in `~/.kube/safed.yaml` by default. `--config` or
+`KUBECTL_SAFED_CONFIG` can point to another file. Top-level `defaults` apply
+automatically when the config file exists. Built-in modes and named profiles
+layer on top of those defaults. CLI flags override scalar values.
 
 ```yaml
+defaults:
+  preflight: strict
+  uncordon-on-failure: true
+  stateful-name-patterns:
+    - ledger
+    - temporal
+
 profiles:
   prod:
-    preflight: strict
-    rollout-timeout: 10m
-    max-concurrency: 1
-    uncordon-on-failure: true
+    timeout: 45m
     emit-events: true
   staging:
     preflight: warn
-    rollout-timeout: 3m
+    rollout-timeout: 5m
     max-concurrency: 3
 ```
 
 ```bash
+kubectl safed drain worker-1
+kubectl safed drain worker-1 --mode=prod
 kubectl safed drain worker-1 --profile=prod
 kubectl safed drain worker-1 --profile=prod --max-concurrency=2
 ```
+
+Built-in modes:
+
+| Mode | Intent |
+|---|---|
+| `prod` | Strict pre-flight checks, events, uncordon on failure, sequential concurrency. |
+| `scale-down` | Batch-oriented node-pool drains with conservative workload batching. |
+| `debug` | Dry-run with a shorter poll interval and bounded timeout. |
 
 ## Logs And Events
 
@@ -345,3 +364,11 @@ make e2e-run TEST=TestDrain_NATS
 The e2e suite creates a k3d cluster, installs NATS, Grafana, and
 kube-state-metrics, then runs the compiled binary against real Kubernetes
 objects.
+
+Useful e2e environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SAFED_E2E_CLUSTER_NAME` | `safed-e2e` | k3d cluster name. |
+| `SAFED_E2E_FLANNEL_BACKEND` | `host-gw` | k3s flannel backend. Set empty to use k3s default. |
+| `K3S_IMAGE` | | Optional k3s image passed to k3d. |

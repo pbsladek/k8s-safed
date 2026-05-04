@@ -40,22 +40,24 @@ type Workload struct {
 	// Priority controls drain order. Lower values are restarted first.
 	// Populated from the kubectl.safed.io/drain-priority annotation;
 	// defaults to DefaultDrainPriority (100) when the annotation is absent.
-	Priority int
+	Priority                  int
+	PriorityAnnotationValue   string
+	PriorityAnnotationInvalid bool
 }
 
 // parseDrainPriority reads the drain-priority annotation and returns its
 // integer value, or DefaultDrainPriority if the annotation is absent or
 // cannot be parsed.
-func parseDrainPriority(annotations map[string]string) int {
+func parseDrainPriority(annotations map[string]string) (int, string, bool) {
 	v, ok := annotations[DrainPriorityAnnotation]
 	if !ok {
-		return DefaultDrainPriority
+		return DefaultDrainPriority, "", false
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return DefaultDrainPriority
+		return DefaultDrainPriority, v, true
 	}
-	return n
+	return n, v, false
 }
 
 func (w Workload) String() string {
@@ -205,12 +207,15 @@ func (f *Finder) resolveDeployment(ctx context.Context, namespace, name string) 
 		return Workload{}, false, fmt.Errorf("getting Deployment %s/%s: %w", namespace, name, err)
 	}
 
+	priority, priorityValue, priorityInvalid := parseDrainPriority(dep.Annotations)
 	w := Workload{
-		Kind:      KindDeployment,
-		Namespace: namespace,
-		Name:      name,
-		Selector:  dep.Spec.Selector,
-		Priority:  parseDrainPriority(dep.Annotations),
+		Kind:                      KindDeployment,
+		Namespace:                 namespace,
+		Name:                      name,
+		Selector:                  dep.Spec.Selector,
+		Priority:                  priority,
+		PriorityAnnotationValue:   priorityValue,
+		PriorityAnnotationInvalid: priorityInvalid,
 	}
 	f.wlCache[wlKey] = w
 	return w, true, nil
@@ -232,12 +237,15 @@ func (f *Finder) resolveStatefulSet(ctx context.Context, namespace, name string)
 		return Workload{}, false, fmt.Errorf("getting StatefulSet %s/%s: %w", namespace, name, err)
 	}
 
+	priority, priorityValue, priorityInvalid := parseDrainPriority(sts.Annotations)
 	w := Workload{
-		Kind:      KindStatefulSet,
-		Namespace: namespace,
-		Name:      name,
-		Selector:  sts.Spec.Selector,
-		Priority:  parseDrainPriority(sts.Annotations),
+		Kind:                      KindStatefulSet,
+		Namespace:                 namespace,
+		Name:                      name,
+		Selector:                  sts.Spec.Selector,
+		Priority:                  priority,
+		PriorityAnnotationValue:   priorityValue,
+		PriorityAnnotationInvalid: priorityInvalid,
 	}
 	f.wlCache[wlKey] = w
 	return w, true, nil

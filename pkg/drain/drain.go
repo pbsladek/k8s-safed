@@ -86,6 +86,9 @@ type Options struct {
 	// logs findings and continues. PreflightModeStrict aborts on any risk-level
 	// issue. PreflightModeOff skips all checks.
 	Preflight PreflightMode
+	// StatefulNamePatterns extends the built-in name patterns used by
+	// preflight to surface known stateful workloads.
+	StatefulNamePatterns []string
 	// SkipWorkloads is a set of "Kind/namespace/name" keys to exclude from
 	// rolling restarts. Skipped workloads still fall through to eviction normally.
 	// Mutually exclusive with OnlyWorkloads.
@@ -228,6 +231,7 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 	// Filter workloads per --skip-workload / --only-workload before pre-flight
 	// so pre-flight only scans workloads that will actually be restarted.
 	workloads = d.filterWorkloads(workloads)
+	d.warnInvalidPriorityAnnotations(workloads)
 
 	// Step 3: Pre-flight checks — surface risks before making any cluster changes.
 	if d.opts.Preflight != PreflightModeOff {
@@ -315,6 +319,16 @@ func (d *Drainer) filterWorkloads(workloads []workload.Workload) []workload.Work
 		filtered = append(filtered, w)
 	}
 	return filtered
+}
+
+func (d *Drainer) warnInvalidPriorityAnnotations(workloads []workload.Workload) {
+	for _, w := range workloads {
+		if !w.PriorityAnnotationInvalid {
+			continue
+		}
+		d.opts.Out.Warnf(wSubject(w), "invalid %s=%q; using default priority %d",
+			workload.DrainPriorityAnnotation, w.PriorityAnnotationValue, workload.DefaultDrainPriority)
+	}
 }
 
 // runWorkloads dispatches rolling restarts according to MaxConcurrency.
@@ -488,7 +502,10 @@ func (d *Drainer) cordon(ctx context.Context, node *corev1.Node) (cordonedByUs b
 	}
 
 	out.Infof(d.opts.NodeName, "Cordoning %q...", d.opts.NodeName)
-	patch := []byte(`{"spec":{"unschedulable":true}}`)
+	patch, err := buildNodeUnschedulablePatch(true)
+	if err != nil {
+		return false, err
+	}
 	_, err = d.client.CoreV1().Nodes().Patch(
 		ctx, d.opts.NodeName,
 		types.StrategicMergePatchType, patch,
@@ -507,8 +524,12 @@ func (d *Drainer) cordon(ctx context.Context, node *corev1.Node) (cordonedByUs b
 func (d *Drainer) uncordon(out *Printer) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	patch := []byte(`{"spec":{"unschedulable":false}}`)
-	_, err := d.client.CoreV1().Nodes().Patch(
+	patch, err := buildNodeUnschedulablePatch(false)
+	if err != nil {
+		out.Infof(d.opts.NodeName, "WARNING: failed to build uncordon patch for %q: %v", d.opts.NodeName, err)
+		return
+	}
+	_, err = d.client.CoreV1().Nodes().Patch(
 		ctx, d.opts.NodeName,
 		types.StrategicMergePatchType, patch,
 		metav1.PatchOptions{},
@@ -518,6 +539,21 @@ func (d *Drainer) uncordon(out *Printer) {
 		return
 	}
 	out.Donef(d.opts.NodeName, "Uncordoned %q (drain failed, --uncordon-on-failure is set)", d.opts.NodeName)
+}
+
+func buildNodeUnschedulablePatch(unschedulable bool) ([]byte, error) {
+	patch := struct {
+		Spec struct {
+			Unschedulable bool `json:"unschedulable"`
+		} `json:"spec"`
+	}{}
+	patch.Spec.Unschedulable = unschedulable
+
+	data, err := json.Marshal(patch)
+	if err != nil {
+		return nil, fmt.Errorf("building node unschedulable patch: %w", err)
+	}
+	return data, nil
 }
 
 // rollingRestart triggers a rolling restart for w, waits for the rollout to
