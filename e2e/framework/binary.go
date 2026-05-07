@@ -146,8 +146,8 @@ func enrichCommandError(ctx context.Context, command string, err error) error {
 		msg += fmt.Sprintf(" (context: %v)", ctxErr)
 	}
 	if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ProcessState != nil {
-		msg += fmt.Sprintf(" (exitCode=%d", exitErr.ProcessState.ExitCode())
-		if status, ok := exitErr.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		msg += fmt.Sprintf(" (exitCode=%d", exitErr.ExitCode())
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
 			msg += fmt.Sprintf(" signal=%s", status.Signal())
 		}
 		msg += ")"

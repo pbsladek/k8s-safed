@@ -25,6 +25,11 @@ func TestManifestTemplatesRenderValidYAML(t *testing.T) {
 			Recreate:                true,
 			ReadinessCommand:        "test -f /tmp/ready",
 		}),
+		"statefulset": StatefulSetManifest(StatefulSetManifestOptions{
+			Namespace: E2ENamespace,
+			Name:      "template-statefulset",
+			Priority:  30,
+		}),
 		"standalone-pod":          StandalonePodManifest(E2ENamespace, "template-pod", true),
 		"replicaset":              ReplicaSetManifest(E2ENamespace, "template-rs", true),
 		"job":                     JobManifest(E2ENamespace, "template-job"),

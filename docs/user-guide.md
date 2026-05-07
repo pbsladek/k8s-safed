@@ -265,9 +265,9 @@ kubectl safed drain worker-1 --resume
 ```
 
 Checkpoint metadata includes the node name and kube context. Resume rejects a
-checkpoint for a different node or context. In multi-node drains, omit
-`--checkpoint-path`; each node uses its own default checkpoint. Custom
-`--checkpoint-path` is only valid for a single-node drain.
+checkpoint for a different node or context before cordoning the node. In
+multi-node drains, omit `--checkpoint-path`; each node uses its own default
+checkpoint. Custom `--checkpoint-path` is only valid for a single-node drain.
 
 Dry-runs do not write checkpoints.
 

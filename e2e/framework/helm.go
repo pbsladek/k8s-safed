@@ -75,12 +75,15 @@ func HelmInstall(ctx context.Context, kubeconfigPath string, r HelmRelease) erro
 			return fmt.Errorf("create values file: %w", err)
 		}
 		if _, err := f.WriteString(r.ValuesYAML); err != nil {
-			f.Close()
-			os.Remove(f.Name())
+			_ = f.Close()
+			_ = os.Remove(f.Name())
 			return fmt.Errorf("write values file: %w", err)
 		}
-		f.Close()
-		defer os.Remove(f.Name())
+		if err := f.Close(); err != nil {
+			_ = os.Remove(f.Name())
+			return fmt.Errorf("close values file: %w", err)
+		}
+		defer func() { _ = os.Remove(f.Name()) }()
 		args = append(args, "-f", f.Name())
 	}
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -457,6 +458,34 @@ func TestDrainer_Run_NoWorkloads(t *testing.T) {
 	n, _ := fakeCS.CoreV1().Nodes().Get(context.Background(), "node1", metav1.GetOptions{})
 	if !n.Spec.Unschedulable {
 		t.Error("node should be cordoned after successful run")
+	}
+}
+
+func TestDrainer_Run_ResumeCheckpointMismatchDoesNotCordon(t *testing.T) {
+	cpPath := filepath.Join(t.TempDir(), "checkpoint.json")
+	cp := &Checkpoint{
+		NodeName:  "other-node",
+		Context:   "prod",
+		Completed: map[string]bool{},
+	}
+	if err := cp.Save(cpPath); err != nil {
+		t.Fatal(err)
+	}
+
+	node := readyNode("node1")
+	fakeCS := fake.NewClientset(&node)
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.Resume = true
+		o.CheckpointPath = cpPath
+		o.CheckpointContext = "prod"
+	})
+
+	if err := d.Run(context.Background()); err == nil {
+		t.Fatal("expected checkpoint mismatch error")
+	}
+	n, _ := fakeCS.CoreV1().Nodes().Get(context.Background(), "node1", metav1.GetOptions{})
+	if n.Spec.Unschedulable {
+		t.Error("checkpoint input errors must not cordon the node")
 	}
 }
 

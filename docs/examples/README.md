@@ -114,7 +114,9 @@ kubectl safed drain worker-2 \
 ```
 
 Completed workloads are skipped from the checkpoint file. The checkpoint is
-removed automatically once the resumed drain succeeds.
+removed automatically once the resumed drain succeeds. If a checkpoint belongs
+to a different node or kube context, `kubectl-safed` rejects it before cordoning
+the node.
 
 ## 7. Use A Custom Checkpoint Path In Automation
 

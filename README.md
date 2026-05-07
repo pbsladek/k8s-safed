@@ -501,6 +501,10 @@ Progress is written to `~/.kube/safed-checkpoints/<context>-<node>.json` after
 each workload completes. The file is deleted automatically on a successful
 drain. On failure it is left in place for the next `--resume` run.
 
+Checkpoint metadata is validated before the node is cordoned. If a checkpoint
+belongs to a different node or kube context, the command exits without making
+the node unschedulable.
+
 In multi-node drains, each node has its own checkpoint file so resuming applies
 independently per node.
 

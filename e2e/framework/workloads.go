@@ -29,6 +29,16 @@ type DeploymentManifestOptions struct {
 	ReadinessCommand        string
 }
 
+// StatefulSetManifestOptions describes a small StatefulSet used by e2e tests.
+type StatefulSetManifestOptions struct {
+	Namespace string
+	Name      string
+	Priority  int
+	Replicas  int32
+	Image     string
+	Command   string
+}
+
 // --------------------------------------------------------------------------
 // Templated manifests — applied with kubectl, not helm
 // --------------------------------------------------------------------------
@@ -52,6 +62,23 @@ func DeploymentManifest(opts DeploymentManifestOptions) string {
 		ReadinessCommand:        opts.ReadinessCommand,
 	}
 	return renderManifest(deploymentTemplate, data)
+}
+
+// StatefulSetManifest returns a small busybox StatefulSet with app=<name>.
+func StatefulSetManifest(opts StatefulSetManifestOptions) string {
+	data := statefulSetTemplateData{
+		Namespace:               namespaceOrDefault(opts.Namespace),
+		Name:                    opts.Name,
+		IncludePriority:         true,
+		Priority:                opts.Priority,
+		Replicas:                defaultInt32(opts.Replicas, 1),
+		ContainerName:           "app",
+		TerminationGraceSeconds: 2,
+		Image:                   defaultString(opts.Image, busyboxImage),
+		Command:                 defaultString(opts.Command, sleepCommand),
+		MemoryRequest:           "16Mi",
+	}
+	return renderManifest(statefulSetTemplate, data)
 }
 
 // StandalonePodManifest returns an unmanaged Pod with app=<name>.
@@ -142,6 +169,19 @@ type deploymentTemplateData struct {
 	ReadinessCommand        string
 }
 
+type statefulSetTemplateData struct {
+	Namespace               string
+	Name                    string
+	IncludePriority         bool
+	Priority                int
+	Replicas                int32
+	ContainerName           string
+	TerminationGraceSeconds int
+	Image                   string
+	Command                 string
+	MemoryRequest           string
+}
+
 type podTemplateData struct {
 	Namespace string
 	Name      string
@@ -215,6 +255,7 @@ func joinManifestDocuments(parts ...string) string {
 }
 
 var deploymentTemplate = mustManifestTemplate("deployment")
+var statefulSetTemplate = mustManifestTemplate("statefulset")
 var podTemplate = mustManifestTemplate("pod")
 var replicaSetTemplate = mustManifestTemplate("replicaset")
 var jobTemplate = mustManifestTemplate("job")

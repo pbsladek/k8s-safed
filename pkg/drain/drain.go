@@ -240,6 +240,18 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 		}
 	}
 
+	// Validate resume metadata before cordoning. A bad checkpoint is an input
+	// error, not a drain failure, so it must not make the node unschedulable.
+	if d.opts.Resume && d.opts.CheckpointPath != "" {
+		cp, err := LoadCheckpoint(d.opts.CheckpointPath)
+		if err != nil {
+			return fmt.Errorf("loading checkpoint: %w", err)
+		}
+		if err := d.validateCheckpoint(cp); err != nil {
+			return err
+		}
+	}
+
 	// Step 4: Cordon.
 	cordonedByUs, err := d.cordon(ctx, node)
 	if err != nil {

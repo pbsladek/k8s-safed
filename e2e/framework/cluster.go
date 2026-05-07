@@ -70,7 +70,9 @@ func (c *Cluster) Create(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create kubeconfig temp file: %w", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close kubeconfig temp file: %w", err)
+	}
 	c.KubeconfigPath = f.Name()
 
 	writeCmd := exec.CommandContext(ctx, "k3d", "kubeconfig", "write", c.Name,
