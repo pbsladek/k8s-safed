@@ -146,8 +146,8 @@ Notes:
 | `--grace-period` | `-1` | Pod termination grace period in seconds. `-1` uses each pod default. |
 | `--max-concurrency` | `1` | Workload rollouts per node. `1` sequential, `0` all workloads, `N` batches of `N`. |
 | `--uncordon-on-failure` | `false` | Uncordon if this drain cordoned the node and then failed. |
-| `--skip-workload` | | Exclude `Kind/namespace/name` from rolling restart. Repeatable. |
-| `--only-workload` | | Restart only listed `Kind/namespace/name` workloads. Repeatable. |
+| `--skip-workload` | | Leave listed managed workloads untouched by restart and conventional eviction. Repeatable. |
+| `--only-workload` | | Restart only listed managed workloads; other managed workloads are left untouched. Repeatable. |
 | `--emit-events` | `false` | Emit Kubernetes Events on node and workload objects. |
 | `--resume` | `false` | Skip workloads already completed in the checkpoint file. |
 | `--checkpoint-path` | | Override checkpoint path for a single-node drain only. |
@@ -156,6 +156,10 @@ Notes:
 | `--stateful-name-pattern` | | Add a custom pre-flight stateful workload name pattern. Repeatable. |
 
 `--skip-workload` and `--only-workload` are mutually exclusive.
+
+For timeout flags, `0` has flag-specific meaning. `--rollout-timeout=0`
+disables the per-workload rollout timeout and relies on `--timeout`; the other
+loop interval/timeouts use their documented defaults when left at zero.
 
 ### Timeouts
 

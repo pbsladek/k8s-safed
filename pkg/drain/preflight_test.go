@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -289,5 +290,43 @@ func TestRunPreflight_StatefulNameDetected(t *testing.T) {
 	// Should not error — stateful name is a note (risk=false), not a risk.
 	if err := d.runPreflight(context.Background(), wls); err != nil {
 		t.Errorf("stateful name note must not cause strict abort, got: %v", err)
+	}
+}
+
+func TestRunPreflight_PDBWarningsAreWorkloadScoped(t *testing.T) {
+	dep := makeDeploymentForPreflight("default", "api", 3, appsv1.RollingUpdateDeploymentStrategyType)
+	relatedPDB := policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "api-pdb"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
+		},
+		Status: policyv1.PodDisruptionBudgetStatus{DisruptionsAllowed: 0},
+	}
+	unrelatedPDB := policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "worker-pdb"},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+		},
+		Status: policyv1.PodDisruptionBudgetStatus{DisruptionsAllowed: 0},
+	}
+	fakeCS := fake.NewClientset(&dep, &relatedPDB, &unrelatedPDB)
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.Preflight = PreflightModeWarn
+	})
+	wls := []workload.Workload{{
+		Kind:      workload.KindDeployment,
+		Namespace: "default",
+		Name:      "api",
+		Selector:  &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
+	}}
+
+	if err := d.runPreflight(context.Background(), wls); err != nil {
+		t.Fatalf("runPreflight: %v", err)
+	}
+	if !pdbMaySelectWorkload(relatedPDB.Spec.Selector, wls) {
+		t.Fatal("related PDB should match workload")
+	}
+	if pdbMaySelectWorkload(unrelatedPDB.Spec.Selector, wls) {
+		t.Fatal("unrelated PDB should not match workload")
 	}
 }

@@ -28,7 +28,7 @@ func TestDrain_DaemonSetNotRestarted(t *testing.T) {
 		t.Fatalf("apply daemonset: %v", err)
 	}
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.DaemonSetManifest)
+		cleanupManifest(t, framework.DaemonSetManifest)
 	}()
 
 	waitAllReady(t)
@@ -64,7 +64,7 @@ func TestDrain_DaemonSetEvictionOverrideDryRun(t *testing.T) {
 		t.Fatalf("apply daemonset: %v", err)
 	}
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.DaemonSetManifest)
+		cleanupManifest(t, framework.DaemonSetManifest)
 	}()
 	waitForPodWithSelectorOnNode(t, ctx, target, framework.E2ENamespace, "app=node-agent", 90*time.Second)
 
@@ -157,7 +157,7 @@ func TestDrain_UnmanagedPodEvictionOptions(t *testing.T) {
 			target := firstAgentNode(t, ctx)
 			defer uncordon(t, target)
 			defer func() {
-				_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, tc.manifest)
+				cleanupManifest(t, tc.manifest)
 			}()
 
 			withOnlyNodeSchedulable(t, ctx, target, func() {
@@ -225,7 +225,7 @@ func TestDrain_PDBAllowedEviction(t *testing.T) {
 		framework.PDBManifest(framework.E2ENamespace, "pdb-allowed", "pdb-allowed", 1),
 	)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	withOnlyNodeSchedulable(t, ctx, target, func() {
 		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, manifest); err != nil {
@@ -276,7 +276,7 @@ func TestDrain_PDBBlockedEviction(t *testing.T) {
 	defer uncordon(t, target)
 
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.StandalonePodWithPDBManifest)
+		cleanupManifest(t, framework.StandalonePodWithPDBManifest)
 	}()
 	withOnlyNodeSchedulable(t, ctx, target, func() {
 		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, framework.StandalonePodWithPDBManifest); err != nil {

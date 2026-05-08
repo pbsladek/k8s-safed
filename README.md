@@ -288,8 +288,8 @@ kubectl safed drain worker-1 --context=prod-cluster
 | `--grace-period` | | `-1` | Pod termination grace period in seconds. `-1` uses the pod's own default. |
 | `--max-concurrency` | | `1` | Number of workload rolling-restarts to run concurrently per node. `1` = sequential, `0` = all at once, `N` = batches of N. |
 | `--uncordon-on-failure` | | `false` | Uncordon the node if the drain fails. Only applies when this run performed the cordon. |
-| `--skip-workload` | | | Exclude a workload from rolling restarts (`Kind/namespace/name`). Repeatable. Mutually exclusive with `--only-workload`. |
-| `--only-workload` | | | Restrict rolling restarts to these workloads only (`Kind/namespace/name`). Repeatable. Mutually exclusive with `--skip-workload`. |
+| `--skip-workload` | | | Leave a managed workload untouched during restart and conventional eviction (`Kind/namespace/name`). Repeatable. Mutually exclusive with `--only-workload`. |
+| `--only-workload` | | | Restart only these managed workloads and leave other managed workloads untouched (`Kind/namespace/name`). Repeatable. Mutually exclusive with `--skip-workload`. |
 | `--emit-events` | | `false` | Emit Kubernetes Events to node and workload objects. Requires `events/create` RBAC. Visible via `kubectl describe`. |
 | `--resume` | | `false` | Resume an interrupted drain, skipping workloads already recorded in the checkpoint file. |
 | `--checkpoint-path` | | | Override the checkpoint file path for a single-node drain. Default: `~/.kube/safed-checkpoints/<context>-<node>.json`. |
@@ -307,6 +307,9 @@ kubectl safed drain worker-1 --context=prod-cluster
 | `--eviction-timeout` | `5m` | Per-pod time to wait for a PDB-blocked eviction to succeed. |
 | `--pdb-retry-interval` | `5s` | Base retry interval when eviction is blocked by a PDB. Doubles each attempt, capped at 60s. |
 | `--poll-interval` | `5s` | Interval between status checks in all wait loops. |
+
+Only `--timeout` and `--rollout-timeout` treat `0` as disabled. Other loop
+timeouts and intervals fall back to their documented defaults when left at zero.
 
 #### Output
 
@@ -479,8 +482,9 @@ kubectl safed drain worker-1 \
   --only-workload=StatefulSet/data/postgres
 ```
 
-Skipped workloads are not rolling-restarted but still fall through to the
-eviction phase, so DaemonSet pods and standalones are handled normally.
+Filtered managed workloads are left untouched by both rolling restart and
+conventional eviction. DaemonSet pods and unmanaged pods are still handled by the
+normal eviction policy unless they belong to a filtered managed workload.
 
 ---
 

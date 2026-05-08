@@ -26,7 +26,7 @@ func TestDrain_ProfileConfigAndCLIOverride(t *testing.T) {
 	target := firstAgentNode(t, ctx)
 	defer uncordon(t, target)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.WorkerManifest)
+		cleanupManifest(t, framework.WorkerManifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, framework.WorkerManifest, "worker")
 
@@ -83,7 +83,7 @@ func TestDrain_ConfigDefaultsModeProfilePrecedence(t *testing.T) {
 	target := firstAgentNode(t, ctx)
 	defer uncordon(t, target)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.WorkerManifest)
+		cleanupManifest(t, framework.WorkerManifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, framework.WorkerManifest, "worker")
 
@@ -151,7 +151,7 @@ func TestDrain_ConfigEnvAndExplicitConfigPrecedence(t *testing.T) {
 	target := firstAgentNode(t, ctx)
 	defer uncordon(t, target)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.WorkerManifest)
+		cleanupManifest(t, framework.WorkerManifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, framework.WorkerManifest, "worker")
 
@@ -278,7 +278,7 @@ func TestDrain_CustomStatefulPatternAndInvalidPriorityWarning(t *testing.T) {
 		Replicas:  2,
 	})
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "ledger-api")
 

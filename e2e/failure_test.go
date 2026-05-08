@@ -25,15 +25,16 @@ func TestDrain_CrashLoopAbort(t *testing.T) {
 	target := firstAgentNode(t, ctx)
 	defer uncordon(t, target)
 
+	manifest := crashingDeploymentManifest("crasher-abort")
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.CrashingDeploymentManifest)
+		cleanupManifest(t, manifest)
 	}()
 	withOnlyNodeSchedulable(t, ctx, target, func() {
-		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, framework.CrashingDeploymentManifest); err != nil {
+		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, manifest); err != nil {
 			t.Fatalf("apply crashing deployment: %v", err)
 		}
 		got, err := framework.WaitForCrashingPod(ctx, testClient, framework.E2ENamespace,
-			framework.CrasherPodSelector, 90*time.Second)
+			"app=crasher-abort", 90*time.Second)
 		if err != nil {
 			t.Fatalf("crashing pod did not crash within timeout: %v", err)
 		}
@@ -63,7 +64,7 @@ func TestDrain_ImagePullAbort(t *testing.T) {
 
 	manifest := simpleDeploymentManifest("imagepull-bad", 100)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "imagepull-bad")
 
@@ -107,15 +108,16 @@ func TestDrain_UncordonOnFailure(t *testing.T) {
 	defer cancel()
 
 	target := firstAgentNode(t, ctx)
+	manifest := crashingDeploymentManifest("crasher-uncordon")
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.CrashingDeploymentManifest)
+		cleanupManifest(t, manifest)
 	}()
 	withOnlyNodeSchedulable(t, ctx, target, func() {
-		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, framework.CrashingDeploymentManifest); err != nil {
+		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, manifest); err != nil {
 			t.Fatalf("apply crashing deployment: %v", err)
 		}
 		got, err := framework.WaitForCrashingPod(ctx, testClient, framework.E2ENamespace,
-			framework.CrasherPodSelector, 90*time.Second)
+			"app=crasher-uncordon", 90*time.Second)
 		if err != nil {
 			t.Fatalf("crashing pod did not crash within timeout: %v", err)
 		}
@@ -145,15 +147,16 @@ func TestDrain_AlreadyCordonedFailureDoesNotUncordon(t *testing.T) {
 	defer cancel()
 
 	target := firstAgentNode(t, ctx)
+	manifest := crashingDeploymentManifest("crasher-already-cordoned")
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.CrashingDeploymentManifest)
+		cleanupManifest(t, manifest)
 	}()
 	withOnlyNodeSchedulable(t, ctx, target, func() {
-		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, framework.CrashingDeploymentManifest); err != nil {
+		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, manifest); err != nil {
 			t.Fatalf("apply crashing deployment: %v", err)
 		}
 		got, err := framework.WaitForCrashingPod(ctx, testClient, framework.E2ENamespace,
-			framework.CrasherPodSelector, 90*time.Second)
+			"app=crasher-already-cordoned", 90*time.Second)
 		if err != nil {
 			t.Fatalf("crashing pod did not crash within timeout: %v", err)
 		}
@@ -180,4 +183,13 @@ func TestDrain_AlreadyCordonedFailureDoesNotUncordon(t *testing.T) {
 		t.Fatalf("output missing already-cordoned uncordon warning\nstdout: %s\nstderr: %s",
 			result.Stdout, result.Stderr)
 	}
+}
+
+func crashingDeploymentManifest(name string) string {
+	return framework.DeploymentManifest(framework.DeploymentManifestOptions{
+		Namespace: framework.E2ENamespace,
+		Name:      name,
+		Priority:  100,
+		Command:   "exit 1",
+	})
 }

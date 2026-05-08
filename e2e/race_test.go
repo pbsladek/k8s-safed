@@ -29,7 +29,7 @@ func TestDrain_StaleReplicaSetOwnerPodIsSkippedAsWorkload(t *testing.T) {
 
 	manifest := framework.StandalonePodManifest(framework.E2ENamespace, "race-stale-rs-pod", false)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	withOnlyNodeSchedulable(t, ctx, target, func() {
 		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, manifest); err != nil {
@@ -82,7 +82,7 @@ func TestDrain_TerminatingPodIsSkippedDuringEviction(t *testing.T) {
 		_ = testClient.CoreV1().Pods(framework.E2ENamespace).Delete(context.Background(), "race-terminating-pod", metav1.DeleteOptions{
 			GracePeriodSeconds: &grace,
 		})
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	})
 	withOnlyNodeSchedulable(t, ctx, target, func() {
 		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, manifest); err != nil {
@@ -127,6 +127,7 @@ func patchPodOwnerReferences(t *testing.T, ctx context.Context, namespace, podNa
 				"kind":       "ReplicaSet",
 				"name":       ownerName,
 				"uid":        "11111111-2222-3333-4444-555555555555",
+				"controller": true,
 			}},
 		},
 	})

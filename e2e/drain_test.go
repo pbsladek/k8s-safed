@@ -148,7 +148,7 @@ func TestDrain_MultipleWorkloads(t *testing.T) {
 		simpleDeploymentManifest("multi-b", 100),
 	)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "multi-a", "multi-b")
 
@@ -200,7 +200,7 @@ func TestDrain_Priority(t *testing.T) {
 		simpleDeploymentManifest("priority-low", 100),
 	)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "priority-high", "priority-low")
 
@@ -249,7 +249,7 @@ func TestDrain_MaxConcurrencyBatches(t *testing.T) {
 		simpleDeploymentManifest("batch-c", 100),
 	)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "batch-a", "batch-b", "batch-c")
 
@@ -311,7 +311,7 @@ func TestDrain_SkipWorkload(t *testing.T) {
 		simpleDeploymentManifest("skip-drop", 100),
 	)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "skip-keep", "skip-drop")
 
@@ -329,6 +329,7 @@ func TestDrain_SkipWorkload(t *testing.T) {
 
 	assertRestarted(t, "Deployment", "skip-keep", beforeKeep)
 	assertNotRestarted(t, "Deployment", "skip-drop", beforeDrop)
+	waitForPodWithSelectorOnNode(t, ctx, target, framework.E2ENamespace, "app=skip-drop", 30*time.Second)
 	if !strings.Contains(result.Stdout, "Skipping Deployment/e2e/skip-drop (--skip-workload)") {
 		t.Errorf("missing skip-workload log line\nstdout: %s", result.Stdout)
 	}
@@ -352,7 +353,7 @@ func TestDrain_OnlyWorkload(t *testing.T) {
 		simpleDeploymentManifest("only-drop", 100),
 	)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "only-keep", "only-drop")
 
@@ -370,6 +371,7 @@ func TestDrain_OnlyWorkload(t *testing.T) {
 
 	assertRestarted(t, "Deployment", "only-keep", beforeKeep)
 	assertNotRestarted(t, "Deployment", "only-drop", beforeDrop)
+	waitForPodWithSelectorOnNode(t, ctx, target, framework.E2ENamespace, "app=only-drop", 30*time.Second)
 	if !strings.Contains(result.Stdout, "Skipping Deployment/e2e/only-drop (not in --only-workload list)") {
 		t.Errorf("missing only-workload log line\nstdout: %s", result.Stdout)
 	}

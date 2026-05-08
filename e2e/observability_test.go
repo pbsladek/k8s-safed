@@ -25,7 +25,7 @@ func TestDrain_EmitEvents(t *testing.T) {
 
 	manifest := simpleDeploymentManifest("events-workload", 100)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "events-workload")
 
@@ -42,17 +42,18 @@ func TestDrain_EmitEvents(t *testing.T) {
 
 	// Poll for current-run node and workload events.
 	deadline := time.Now().Add(30 * time.Second)
-	var foundNode, foundWorkload bool
-	for !(foundNode && foundWorkload) && time.Now().Before(deadline) {
+	foundNode := map[string]bool{}
+	foundWorkload := map[string]bool{}
+	for (!foundNode["Draining"] || !foundNode["Drained"] ||
+		!foundWorkload["RollingRestartTriggered"] || !foundWorkload["RollingRestartComplete"]) &&
+		time.Now().Before(deadline) {
 		nodeEvents, err := framework.EventsForNode(ctx, testClient, target)
 		if err != nil {
 			t.Fatalf("list node events: %v", err)
 		}
 		for _, e := range nodeEvents {
-			if (e.Reason == "Draining" || e.Reason == "Drained") &&
-				e.CreationTimestamp.Time.After(since) {
-				foundNode = true
-				break
+			if e.CreationTimestamp.Time.After(since) {
+				foundNode[e.Reason] = true
 			}
 		}
 
@@ -62,22 +63,79 @@ func TestDrain_EmitEvents(t *testing.T) {
 			t.Fatalf("list workload events: %v", err)
 		}
 		for _, e := range workloadEvents {
-			if (e.Reason == "RollingRestartTriggered" || e.Reason == "RollingRestartComplete") &&
-				e.CreationTimestamp.Time.After(since) {
-				foundWorkload = true
-				break
+			if e.CreationTimestamp.Time.After(since) {
+				foundWorkload[e.Reason] = true
 			}
 		}
 
-		if !(foundNode && foundWorkload) {
+		if !foundNode["Draining"] || !foundNode["Drained"] ||
+			!foundWorkload["RollingRestartTriggered"] || !foundWorkload["RollingRestartComplete"] {
 			time.Sleep(2 * time.Second)
 		}
 	}
-	if !foundNode {
-		t.Errorf("no current Draining/Drained event on node %s after --emit-events", target)
+	if !foundNode["Draining"] || !foundNode["Drained"] {
+		t.Errorf("missing current node events after --emit-events: got=%v", foundNode)
 	}
-	if !foundWorkload {
-		t.Errorf("no current rolling restart event on Deployment/events-workload after --emit-events")
+	if !foundWorkload["RollingRestartTriggered"] || !foundWorkload["RollingRestartComplete"] {
+		t.Errorf("missing current workload events after --emit-events: got=%v", foundWorkload)
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestDrain_EmitEventsFailure
+// --------------------------------------------------------------------------
+
+func TestDrain_EmitEventsFailure(t *testing.T) {
+	waitAllReady(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancel()
+
+	target := firstAgentNode(t, ctx)
+	defer uncordon(t, target)
+	defer func() {
+		cleanupManifest(t, framework.StandalonePodWithPDBManifest)
+	}()
+	withOnlyNodeSchedulable(t, ctx, target, func() {
+		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, framework.StandalonePodWithPDBManifest); err != nil {
+			t.Fatalf("apply PDB-blocked standalone pod: %v", err)
+		}
+		waitForPodWithSelectorOnNode(t, ctx, target, framework.E2ENamespace, framework.StandalonePDBPodSelector, workloadReady)
+	})
+
+	since := time.Now().Add(-1 * time.Second)
+	result := testBinary.Drain(ctx, target,
+		"--emit-events",
+		"--preflight", "off",
+		"--force",
+		"--eviction-timeout", "10s",
+		"--pdb-retry-interval", "1s",
+		"--uncordon-on-failure",
+		"--poll-interval", "1s",
+	)
+	if result.Err == nil {
+		t.Fatalf("drain should fail for PDB-blocked standalone pod\nstdout: %s\nstderr: %s", result.Stdout, result.Stderr)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	found := false
+	for !found && time.Now().Before(deadline) {
+		nodeEvents, err := framework.EventsForNode(ctx, testClient, target)
+		if err != nil {
+			t.Fatalf("list node events: %v", err)
+		}
+		for _, e := range nodeEvents {
+			if e.Reason == "DrainFailed" && e.CreationTimestamp.Time.After(since) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			time.Sleep(2 * time.Second)
+		}
+	}
+	if !found {
+		t.Fatalf("no current DrainFailed event on node %s after failed --emit-events drain", target)
 	}
 }
 
@@ -111,7 +169,7 @@ func TestDrain_MultiNamespace(t *testing.T) {
 		}),
 	)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployManifestDeploymentsOnNode(t, ctx, target, manifest,
 		deploymentRef{namespace: framework.E2ENamespace, name: "multi-ns-primary"},
@@ -184,7 +242,7 @@ func TestDrain_JSONLogFormat(t *testing.T) {
 
 	manifest := simpleDeploymentManifest("json-workload", 100)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "json-workload")
 
@@ -219,7 +277,7 @@ func TestDrain_JSONLogFormatFailure(t *testing.T) {
 	target := firstAgentNode(t, ctx)
 	defer uncordon(t, target)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.WorkerManifest)
+		cleanupManifest(t, framework.WorkerManifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, framework.WorkerManifest, "worker")
 

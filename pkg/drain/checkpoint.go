@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/pbsladek/k8s-safed/pkg/workload"
 )
@@ -21,9 +22,22 @@ import (
 //
 // File location: ~/.kube/safed-checkpoints/<context>-<node>.json
 type Checkpoint struct {
-	NodeName  string          `json:"nodeName"`
-	Context   string          `json:"context"`
-	Completed map[string]bool `json:"completed"`
+	NodeName  string                    `json:"nodeName"`
+	Context   string                    `json:"context"`
+	Completed map[string]bool           `json:"completed,omitempty"`
+	Workloads map[string]CheckpointWork `json:"workloads,omitempty"`
+}
+
+// CheckpointWork records the workload identity observed when a checkpoint entry
+// was written. Completed is kept separate from the legacy Completed map so older
+// checkpoint files can still be read.
+type CheckpointWork struct {
+	Kind        string    `json:"kind"`
+	Namespace   string    `json:"namespace"`
+	Name        string    `json:"name"`
+	UID         string    `json:"uid,omitempty"`
+	Generation  int64     `json:"generation,omitempty"`
+	CompletedAt time.Time `json:"completedAt"`
 }
 
 // CheckpointPath returns the default path for a checkpoint file, namespaced
@@ -50,7 +64,7 @@ func sanitizeFilename(s string) string {
 func LoadCheckpoint(path string) (*Checkpoint, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return &Checkpoint{Completed: make(map[string]bool)}, nil
+		return newCheckpoint(), nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("reading checkpoint %q: %w", path, err)
@@ -62,7 +76,17 @@ func LoadCheckpoint(path string) (*Checkpoint, error) {
 	if cp.Completed == nil {
 		cp.Completed = make(map[string]bool)
 	}
+	if cp.Workloads == nil {
+		cp.Workloads = make(map[string]CheckpointWork)
+	}
 	return &cp, nil
+}
+
+func newCheckpoint() *Checkpoint {
+	return &Checkpoint{
+		Completed: make(map[string]bool),
+		Workloads: make(map[string]CheckpointWork),
+	}
 }
 
 // Save writes the checkpoint to path atomically. The directory is created if
@@ -89,12 +113,34 @@ func (c *Checkpoint) Save(path string) error {
 
 // MarkDone records w as completed in the checkpoint.
 func (c *Checkpoint) MarkDone(w workload.Workload) {
-	c.Completed[workloadKey(w)] = true
+	key := workloadKey(w)
+	if c.Completed == nil {
+		c.Completed = make(map[string]bool)
+	}
+	if c.Workloads == nil {
+		c.Workloads = make(map[string]CheckpointWork)
+	}
+	c.Completed[key] = true
+	c.Workloads[key] = CheckpointWork{
+		Kind:        string(w.Kind),
+		Namespace:   w.Namespace,
+		Name:        w.Name,
+		UID:         string(w.UID),
+		Generation:  w.Generation,
+		CompletedAt: time.Now().UTC(),
+	}
 }
 
 // IsDone reports whether w was previously completed.
 func (c *Checkpoint) IsDone(w workload.Workload) bool {
 	return c.Completed[workloadKey(w)]
+}
+
+// Work returns checkpoint metadata for w. The boolean is false for legacy
+// checkpoint entries that only have the Completed map.
+func (c *Checkpoint) Work(w workload.Workload) (CheckpointWork, bool) {
+	work, ok := c.Workloads[workloadKey(w)]
+	return work, ok
 }
 
 // DeleteCheckpoint removes the checkpoint file. A missing file is not an error.

@@ -71,7 +71,7 @@ func TestDrain_RBACMissingDeploymentPatchUncordonsAfterFailure(t *testing.T) {
 
 	manifest := simpleDeploymentManifest("rbac-no-deployment-patch", 50)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "rbac-no-deployment-patch")
 
@@ -119,7 +119,7 @@ func TestDrain_RBACMissingPodEvictionUncordonsAfterFailure(t *testing.T) {
 
 	manifest := framework.StandalonePodManifest(framework.E2ENamespace, "rbac-no-pod-eviction", false)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	withOnlyNodeSchedulable(t, ctx, target, func() {
 		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, manifest); err != nil {
@@ -176,7 +176,7 @@ func TestDrain_RBACMissingEventCreateIsBestEffort(t *testing.T) {
 	defer uncordon(t, target)
 
 	kubeconfigPath := restrictedDrainKubeconfig(t, ctx, "no-events-create", []rbacv1.PolicyRule{
-		{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"get"}},
+		{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"get", "patch"}},
 		{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"list", "get"}},
 		{APIGroups: []string{"apps"}, Resources: []string{"deployments", "replicasets", "statefulsets"}, Verbs: []string{"get"}},
 	})
@@ -187,16 +187,14 @@ func TestDrain_RBACMissingEventCreateIsBestEffort(t *testing.T) {
 
 	result := restricted.Drain(ctx, target,
 		"--preflight", "off",
-		"--dry-run",
 		"--emit-events",
 		"--only-workload", "Deployment/e2e/does-not-exist",
 		"--poll-interval", "1s",
 	)
 	if result.Err != nil {
-		t.Fatalf("event RBAC failure should be best-effort in dry-run: %v\nstdout: %s\nstderr: %s",
+		t.Fatalf("event RBAC failure should be best-effort: %v\nstdout: %s\nstderr: %s",
 			result.Err, result.Stdout, result.Stderr)
 	}
-	verifyNodeNotCordoned(t, target)
 
 	if !strings.Contains(result.Stdout+result.Stderr, `failed to emit event "Draining"`) {
 		t.Fatalf("output missing best-effort event warning\nstdout: %s\nstderr: %s", result.Stdout, result.Stderr)

@@ -13,6 +13,7 @@ import (
 )
 
 const eventSourceComponent = "kubectl-safed"
+const eventCreateTimeout = 5 * time.Second
 
 // EventEmitter emits Kubernetes Events to node and workload objects during a
 // drain. It is a no-op when disabled (--emit-events is false), so it is safe
@@ -73,7 +74,10 @@ func (e *EventEmitter) build(kind, name, namespace, reason, msg, evType string) 
 }
 
 func (e *EventEmitter) create(ctx context.Context, namespace string, ev *corev1.Event) {
-	_, err := e.client.CoreV1().Events(namespace).Create(ctx, ev, metav1.CreateOptions{})
+	createCtx, cancel := context.WithTimeout(ctx, eventCreateTimeout)
+	defer cancel()
+
+	_, err := e.client.CoreV1().Events(namespace).Create(createCtx, ev, metav1.CreateOptions{})
 	if err != nil {
 		// Event emission failures are best-effort; log but don't abort the drain.
 		e.out.Warnf(ev.InvolvedObject.Name, "failed to emit event %q: %v", ev.Reason, err)

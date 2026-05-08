@@ -12,6 +12,7 @@ import (
 
 	"github.com/pbsladek/k8s-safed/e2e/framework"
 	drainpkg "github.com/pbsladek/k8s-safed/pkg/drain"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // --------------------------------------------------------------------------
@@ -32,18 +33,12 @@ func TestDrain_CheckpointResume(t *testing.T) {
 		simpleDeploymentManifest("resume-run", 100),
 	)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "resume-skip", "resume-run")
 
 	cpPath := filepath.Join(t.TempDir(), "checkpoint.json")
-	cpData := mustJSONPatch(t, drainpkg.Checkpoint{
-		NodeName: target,
-		Context:  "",
-		Completed: map[string]bool{
-			"Deployment/e2e/resume-skip": true,
-		},
-	})
+	cpData := mustJSONPatch(t, checkpointForDeployment(t, ctx, target, framework.E2ENamespace, "resume-skip"))
 	if err := os.WriteFile(cpPath, cpData, 0600); err != nil {
 		t.Fatalf("write checkpoint: %v", err)
 	}
@@ -194,7 +189,7 @@ func TestDrain_CheckpointResumeAfterProcessKill(t *testing.T) {
 		simpleDeploymentManifest("interrupt-pending", 100),
 	)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "interrupt-done", "interrupt-pending")
 	setDeploymentMinReadySeconds(t, ctx, framework.E2ENamespace, "interrupt-pending", 25)
@@ -243,11 +238,38 @@ func TestDrain_CheckpointResumeAfterProcessKill(t *testing.T) {
 		t.Fatalf("completed workload should not restart on resume: before=%q after=%q", afterKillDone, after)
 	}
 	assertRestarted(t, "Deployment", "interrupt-pending", afterKillPending)
-	if !strings.Contains(result.Stdout, "Skipping Deployment/e2e/interrupt-done (already completed per checkpoint)") {
-		t.Fatalf("resume output did not show checkpoint skip\nstdout: %s", result.Stdout)
+	if strings.Contains(result.Stdout, "Deployment/e2e/interrupt-done") {
+		t.Fatalf("completed workload should not be restarted on resume\nstdout: %s", result.Stdout)
 	}
 	if _, err := os.Stat(cpPath); !os.IsNotExist(err) {
 		t.Fatalf("checkpoint should be deleted after successful resume, stat err: %v", err)
+	}
+}
+
+func checkpointForDeployment(t *testing.T, ctx context.Context, nodeName, namespace, name string) drainpkg.Checkpoint {
+	t.Helper()
+
+	dep, err := testClient.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get deployment %s/%s for checkpoint metadata: %v", namespace, name, err)
+	}
+	key := "Deployment/" + namespace + "/" + name
+	return drainpkg.Checkpoint{
+		NodeName: nodeName,
+		Context:  "",
+		Completed: map[string]bool{
+			key: true,
+		},
+		Workloads: map[string]drainpkg.CheckpointWork{
+			key: {
+				Kind:        "Deployment",
+				Namespace:   namespace,
+				Name:        name,
+				UID:         string(dep.UID),
+				Generation:  dep.Generation,
+				CompletedAt: time.Now().UTC(),
+			},
+		},
 	}
 }
 
@@ -269,7 +291,7 @@ func TestDrain_GlobalTimeoutKeepsCheckpointAndUncordons(t *testing.T) {
 		simpleDeploymentManifest("timeout-slow", 100),
 	)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "timeout-done", "timeout-slow")
 	setDeploymentMinReadySeconds(t, ctx, framework.E2ENamespace, "timeout-slow", 90)

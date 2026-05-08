@@ -79,13 +79,13 @@ e2e-checkpoint: ## Run checkpoint/resume e2e tests
 	$(E2E_ENV) $(GO) test $(E2E_FLAGS) -run 'TestDrain_.*Checkpoint|TestDrain_GlobalTimeoutKeepsCheckpointAndUncordons' $(E2E_PKG)
 
 e2e-observability: ## Run events/logging e2e tests
-	$(E2E_ENV) $(GO) test $(E2E_FLAGS) -run 'TestDrain_(EmitEvents|MultiNamespace|JSONLogFormat|JSONLogFormatFailure)$$' $(E2E_PKG)
+	$(E2E_ENV) $(GO) test $(E2E_FLAGS) -run 'TestDrain_(EmitEvents|EmitEventsFailure|MultiNamespace|JSONLogFormat|JSONLogFormatFailure)$$' $(E2E_PKG)
 
 e2e-nodes: ## Run node selector and multi-node e2e tests
 	$(E2E_ENV) $(GO) test $(E2E_FLAGS) -run 'TestDrain_(MultiNodeRejectsCheckpointPath|NodeSelector|NodeSelectorErrors|MultiNode|MultiNodePartialFailureUncordonsFailedNodeOnly)$$' $(E2E_PKG)
 
 e2e-focused: ## Run recently added edge-case e2e coverage
-	$(E2E_ENV) $(GO) test $(E2E_FLAGS) -run 'TestDrain_(ConfigEnvAndExplicitConfigPrecedence|CorruptCheckpointFailsBeforeCordon|CheckpointResumeRejectsContextMismatchBeforeCordon|AlreadyCordonedFailureDoesNotUncordon|MultiNodePartialFailureUncordonsFailedNodeOnly|StaleReplicaSetOwnerPodIsSkippedAsWorkload|TerminatingPodIsSkippedDuringEviction|RBACMissingDeploymentPatchUncordonsAfterFailure|RBACMissingPodEvictionUncordonsAfterFailure|RBACMissingEventCreateIsBestEffort|RBACNamespacedPodListFailsBeforeMutation)$$' $(E2E_PKG)
+	$(E2E_ENV) $(GO) test $(E2E_FLAGS) -run 'TestDrain_(SkipWorkload|OnlyWorkload|ConfigEnvAndExplicitConfigPrecedence|CorruptCheckpointFailsBeforeCordon|CheckpointResumeRejectsContextMismatchBeforeCordon|AlreadyCordonedFailureDoesNotUncordon|MultiNodePartialFailureUncordonsFailedNodeOnly|EmitEvents|EmitEventsFailure|StaleReplicaSetOwnerPodIsSkippedAsWorkload|TerminatingPodIsSkippedDuringEviction|RBACMissingDeploymentPatchUncordonsAfterFailure|RBACMissingPodEvictionUncordonsAfterFailure|RBACMissingEventCreateIsBestEffort|RBACNamespacedPodListFailsBeforeMutation)$$' $(E2E_PKG)
 
 e2e-run: ## Run a single e2e test by name: make e2e-run TEST=TestDrain_Basic
 	$(E2E_ENV) $(GO) test $(E2E_FLAGS) -run $(TEST) $(E2E_PKG)

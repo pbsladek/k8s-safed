@@ -23,7 +23,7 @@ func TestDrain_Preflight_WarnMode(t *testing.T) {
 	target := firstAgentNode(t, ctx)
 	defer uncordon(t, target)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.WorkerManifest)
+		cleanupManifest(t, framework.WorkerManifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, framework.WorkerManifest, "worker")
 
@@ -54,7 +54,7 @@ func TestDrain_Preflight_StrictMode(t *testing.T) {
 	target := firstAgentNode(t, ctx)
 	defer uncordon(t, target)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.WorkerManifest)
+		cleanupManifest(t, framework.WorkerManifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, framework.WorkerManifest, "worker")
 
@@ -96,7 +96,7 @@ func TestDrain_Preflight_RecreateStrictMode(t *testing.T) {
 		Recreate: true,
 	})
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, manifest, "recreate-risk")
 
@@ -135,7 +135,7 @@ func TestDrain_Preflight_StatefulSetSingleReplicaStrictMode(t *testing.T) {
 		Replicas: 1,
 	})
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	withOnlyNodeSchedulable(t, ctx, target, func() {
 		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, manifest); err != nil {
@@ -175,7 +175,7 @@ func TestDrain_Preflight_PDBZeroDisruptionsNote(t *testing.T) {
 	target := firstAgentNode(t, ctx)
 	defer uncordon(t, target)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.BlockingPDBManifest)
+		cleanupManifest(t, framework.BlockingPDBManifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, target, framework.BlockingPDBManifest, "pdb-target")
 

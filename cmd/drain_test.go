@@ -1,12 +1,18 @@
 package cmd
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/pbsladek/k8s-safed/pkg/k8s"
 	"github.com/spf13/cobra"
 )
 
@@ -251,6 +257,66 @@ profiles:
 	}
 }
 
+func TestApplyConfig_AllProfileFieldsAreWired(t *testing.T) {
+	cfgPath := writeDrainConfig(t, `
+defaults:
+  timeout: 11m
+  rollout-timeout: 12m
+  pod-vacate-timeout: 13m
+  eviction-timeout: 14m
+  pdb-retry-interval: 15s
+  poll-interval: 16s
+  max-concurrency: 2
+  node-concurrency: 3
+  preflight: strict
+  log-format: json
+  dry-run: true
+  force: true
+  ignore-daemonsets: false
+  delete-emptydir-data: true
+  force-delete-standalone: true
+  uncordon-on-failure: true
+  emit-events: true
+  stateful-name-patterns:
+    - ledger
+`)
+	opts := defaultDrainOptionsForTest()
+	opts.configFile = cfgPath
+
+	if err := applyConfig(drainCommandForConfigTest(), opts); err != nil {
+		t.Fatalf("applyConfig: %v", err)
+	}
+
+	checks := []struct {
+		name string
+		ok   bool
+	}{
+		{"timeout", opts.timeout == 11*time.Minute},
+		{"rollout-timeout", opts.rolloutTimeout == 12*time.Minute},
+		{"pod-vacate-timeout", opts.podVacateTimeout == 13*time.Minute},
+		{"eviction-timeout", opts.evictionTimeout == 14*time.Minute},
+		{"pdb-retry-interval", opts.pdbRetryInterval == 15*time.Second},
+		{"poll-interval", opts.pollInterval == 16*time.Second},
+		{"max-concurrency", opts.maxConcurrency == 2},
+		{"node-concurrency", opts.nodeConcurrency == 3},
+		{"preflight", opts.preflight == "strict"},
+		{"log-format", opts.logFormat == "json"},
+		{"dry-run", opts.dryRun},
+		{"force", opts.force},
+		{"ignore-daemonsets", !opts.skipDaemonSets},
+		{"delete-emptydir-data", opts.deleteEmptyDir},
+		{"force-delete-standalone", opts.forceDeleteStandalone},
+		{"uncordon-on-failure", opts.uncordonOnFailure},
+		{"emit-events", opts.emitEvents},
+		{"stateful-name-patterns", strings.Join(opts.statefulNamePatterns, ",") == "ledger"},
+	}
+	for _, check := range checks {
+		if !check.ok {
+			t.Errorf("%s was not applied from config profile", check.name)
+		}
+	}
+}
+
 func TestApplyConfig_InvalidMode(t *testing.T) {
 	opts := defaultDrainOptionsForTest()
 	opts.mode = "unknown"
@@ -260,6 +326,33 @@ func TestApplyConfig_InvalidMode(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid --mode") {
 		t.Fatalf("error = %q, want invalid --mode", err.Error())
+	}
+}
+
+func TestResolveNodeNames_SelectorReturnsSortedMatches(t *testing.T) {
+	client := &k8s.Client{Kubernetes: fake.NewClientset(
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-b", Labels: map[string]string{"pool": "spot"}}},
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{"pool": "spot"}}},
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-c", Labels: map[string]string{"pool": "ondemand"}}},
+	)}
+
+	got, err := resolveNodeNames(context.Background(), client, nil, "pool=spot")
+	if err != nil {
+		t.Fatalf("resolveNodeNames: %v", err)
+	}
+	if strings.Join(got, ",") != "node-a,node-b" {
+		t.Fatalf("nodes = %v, want node-a,node-b", got)
+	}
+}
+
+func TestResolveNodeNames_SelectorNoMatches(t *testing.T) {
+	client := &k8s.Client{Kubernetes: fake.NewClientset(
+		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{"pool": "ondemand"}}},
+	)}
+
+	_, err := resolveNodeNames(context.Background(), client, nil, "pool=spot")
+	if err == nil || !strings.Contains(err.Error(), "no nodes matched selector") {
+		t.Fatalf("err = %v, want no-match error", err)
 	}
 }
 

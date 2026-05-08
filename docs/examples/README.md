@@ -63,8 +63,8 @@ autoscaler or operator runbook to proceed.
 
 ## 4. Drain Only API Workloads On A Shared Node
 
-Restrict rolling restarts to a known set of workloads and leave everything else
-untouched by the managed restart phase.
+Restrict rolling restarts to a known set of workloads and leave other managed
+workloads untouched by both the restart and conventional eviction phases.
 
 ```bash
 kubectl safed drain worker-7 \

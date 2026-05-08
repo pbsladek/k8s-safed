@@ -165,7 +165,7 @@ func TestDrain_MultiNode(t *testing.T) {
 
 	manifest := simpleDeploymentManifest("multi-node", 100)
 	defer func() {
-		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+		cleanupManifest(t, manifest)
 	}()
 	deployDeploymentsOnNode(t, ctx, agents[0], manifest, "multi-node")
 

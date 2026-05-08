@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/pbsladek/k8s-safed/pkg/config"
@@ -136,9 +135,9 @@ Examples:
 	cmd.Flags().StringVar(&opts.preflight, "preflight", "warn",
 		`Pre-flight check mode: "warn" (log risks, continue), "strict" (abort on any risk), "off" (skip all checks)`)
 	cmd.Flags().StringArrayVar(&opts.skipWorkloads, "skip-workload", nil,
-		`Exclude a workload from rolling restarts (format: Kind/namespace/name, e.g. Deployment/default/api). Repeatable. Mutually exclusive with --only-workload.`)
+		`Leave a managed workload untouched by restart and conventional eviction (format: Kind/namespace/name, e.g. Deployment/default/api). Repeatable. Mutually exclusive with --only-workload.`)
 	cmd.Flags().StringArrayVar(&opts.onlyWorkloads, "only-workload", nil,
-		`Restrict rolling restarts to these workloads only (format: Kind/namespace/name). Repeatable. Mutually exclusive with --skip-workload.`)
+		`Restart only these managed workloads and leave other managed workloads untouched (format: Kind/namespace/name). Repeatable. Mutually exclusive with --skip-workload.`)
 	cmd.Flags().StringVar(&opts.profile, "profile", "",
 		`Load flag defaults from a named profile in the safed config file (see --config). CLI flags override profile values.`)
 	cmd.Flags().StringVar(&opts.configFile, "config", "",
@@ -191,6 +190,10 @@ func runDrain(cmd *cobra.Command, nodeArgs []string, opts *drainOptions) error {
 	}
 
 	out := drain.NewPrinterWithFormat(os.Stdout, drain.LogFormat(opts.logFormat))
+	var coordinator *drain.WorkloadCoordinator
+	if len(nodes) > 1 {
+		coordinator = drain.NewWorkloadCoordinator()
+	}
 
 	drainNode := func(ctx context.Context, nodeName string) error {
 		cpPath := opts.checkpointPath
@@ -228,6 +231,7 @@ func runDrain(cmd *cobra.Command, nodeArgs []string, opts *drainOptions) error {
 			Resume:                opts.resume,
 			CheckpointPath:        cpPath,
 			CheckpointContext:     kubeCtx,
+			WorkloadCoordinator:   coordinator,
 		})
 		return drainer.Run(ctx)
 	}
@@ -235,6 +239,10 @@ func runDrain(cmd *cobra.Command, nodeArgs []string, opts *drainOptions) error {
 	concurrency := opts.nodeConcurrency
 	if concurrency <= 0 {
 		concurrency = len(nodes)
+		out.Warnf("drain", "--node-concurrency=0 drains all %d node(s) concurrently; monitor API server and workload capacity", concurrency)
+	}
+	if concurrency > 10 {
+		out.Warnf("drain", "node concurrency is %d; high parallelism can create API and scheduling pressure", concurrency)
 	}
 
 	// Sequential fast-path.
@@ -364,6 +372,7 @@ func resolveNodeNames(ctx context.Context, client *k8s.Client, nodeArgs []string
 		for i, n := range nodeList.Items {
 			names[i] = n.Name
 		}
+		sort.Strings(names)
 		return names, nil
 	}
 	return nil, fmt.Errorf("listing nodes with selector %q: %w", nodeSelector, lastErr)
@@ -371,10 +380,7 @@ func resolveNodeNames(ctx context.Context, client *k8s.Client, nodeArgs []string
 
 // isTransientCmdError mirrors drain.isTransientAPIError for use in the cmd package.
 func isTransientCmdError(err error) bool {
-	return k8serrors.IsInternalError(err) ||
-		k8serrors.IsServerTimeout(err) ||
-		k8serrors.IsTimeout(err) ||
-		k8serrors.IsTooManyRequests(err)
+	return k8s.IsTransientAPIError(err)
 }
 
 // effectiveKubeContext returns the kubeconfig context that this command will

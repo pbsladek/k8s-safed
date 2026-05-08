@@ -15,6 +15,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -113,14 +114,78 @@ type Options struct {
 	// CheckpointContext is the kubeconfig context used for checkpoint metadata
 	// and resume validation. It may be empty when the context cannot be resolved.
 	CheckpointContext string
+	// WorkloadCoordinator deduplicates rolling restarts across concurrent node
+	// drains in the same process. Each node still verifies that its own pods left.
+	WorkloadCoordinator *WorkloadCoordinator
 }
 
 // Drainer orchestrates the safe drain sequence.
 type Drainer struct {
-	opts   Options
-	client kubernetes.Interface
-	finder *workload.Finder
-	events *EventEmitter
+	opts               Options
+	client             kubernetes.Interface
+	finder             *workload.Finder
+	events             *EventEmitter
+	protectedWorkloads []workload.Workload
+}
+
+// WorkloadCoordinator coordinates workload restarts across concurrently running
+// Drainers. It is intentionally process-local; it prevents duplicate restart
+// patches during a single kubectl-safed invocation.
+type WorkloadCoordinator struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+	done  map[string]struct{}
+}
+
+// NewWorkloadCoordinator creates a process-local workload restart coordinator.
+func NewWorkloadCoordinator() *WorkloadCoordinator {
+	return &WorkloadCoordinator{
+		locks: make(map[string]*sync.Mutex),
+		done:  make(map[string]struct{}),
+	}
+}
+
+func (c *WorkloadCoordinator) Do(ctx context.Context, w workload.Workload, fn func(context.Context) error) error {
+	if c == nil {
+		return fn(ctx)
+	}
+	key := workloadKey(w)
+	lock := c.lockFor(key)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	_, alreadyDone := c.done[key]
+	c.mu.Unlock()
+	if alreadyDone {
+		return nil
+	}
+	if err := fn(ctx); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if c.done == nil {
+		c.done = make(map[string]struct{})
+	}
+	c.done[key] = struct{}{}
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *WorkloadCoordinator) lockFor(key string) *sync.Mutex {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.locks == nil {
+		c.locks = make(map[string]*sync.Mutex)
+	}
+	lock := c.locks[key]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		c.locks[key] = lock
+	}
+	return lock
 }
 
 // pollInterval returns the configured poll interval, falling back to 5 s.
@@ -163,7 +228,7 @@ func NewDrainer(opts Options) *Drainer {
 		opts:   opts,
 		client: opts.Client.Kubernetes,
 		finder: workload.NewFinder(opts.Client.Kubernetes),
-		events: NewEventEmitter(opts.Client.Kubernetes, opts.Out, opts.EmitEvents),
+		events: NewEventEmitter(opts.Client.Kubernetes, opts.Out, opts.EmitEvents && !opts.DryRun),
 	}
 }
 
@@ -230,6 +295,8 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 
 	// Filter workloads per --skip-workload / --only-workload before pre-flight
 	// so pre-flight only scans workloads that will actually be restarted.
+	// Excluded managed workloads are also protected from conventional eviction;
+	// these flags mean "leave this workload alone", not merely "avoid restart".
 	workloads = d.filterWorkloads(workloads)
 	d.warnInvalidPriorityAnnotations(workloads)
 
@@ -300,6 +367,9 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 		out.DryRunf(d.opts.NodeName, "Dry-run complete — no changes were made to %q", d.opts.NodeName)
 	} else {
 		elapsed := time.Since(start).Round(time.Second)
+		if len(d.protectedWorkloads) > 0 {
+			out.Warnf(d.opts.NodeName, "%d filtered managed workload(s) were left untouched; node may still have pods by design", len(d.protectedWorkloads))
+		}
 		// Use context.Background() so the event is reliably emitted even if
 		// the drain context expired right as the last workload completed.
 		d.events.NodeEvent(context.Background(), d.opts.NodeName, "Drained",
@@ -313,6 +383,7 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 // filterWorkloads applies SkipWorkloads / OnlyWorkloads filtering and logs
 // each exclusion. It is a no-op when both maps are empty.
 func (d *Drainer) filterWorkloads(workloads []workload.Workload) []workload.Workload {
+	d.protectedWorkloads = nil
 	if len(d.opts.SkipWorkloads) == 0 && len(d.opts.OnlyWorkloads) == 0 {
 		return workloads
 	}
@@ -322,10 +393,12 @@ func (d *Drainer) filterWorkloads(workloads []workload.Workload) []workload.Work
 		key := fmt.Sprintf("%s/%s/%s", w.Kind, w.Namespace, w.Name)
 		if len(d.opts.OnlyWorkloads) > 0 && !d.opts.OnlyWorkloads[key] {
 			out.Infof(d.opts.NodeName, "Skipping %s (not in --only-workload list)", wSubject(w))
+			d.protectedWorkloads = append(d.protectedWorkloads, w)
 			continue
 		}
 		if d.opts.SkipWorkloads[key] {
 			out.Infof(d.opts.NodeName, "Skipping %s (--skip-workload)", wSubject(w))
+			d.protectedWorkloads = append(d.protectedWorkloads, w)
 			continue
 		}
 		filtered = append(filtered, w)
@@ -379,7 +452,11 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 		}
 		remaining := workloads[:0:0]
 		for _, w := range workloads {
-			if cp.IsDone(w) {
+			skip, err := d.checkpointCanSkip(ctx, cp, w)
+			if err != nil {
+				return err
+			}
+			if skip {
 				d.opts.Out.Infof(d.opts.NodeName, "Skipping %s (already completed per checkpoint)", wSubject(w))
 				continue
 			}
@@ -392,7 +469,7 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 		}
 	}
 	if cp == nil {
-		cp = &Checkpoint{Completed: make(map[string]bool)}
+		cp = newCheckpoint()
 	}
 	cp.NodeName = d.opts.NodeName
 	cp.Context = d.opts.CheckpointContext
@@ -435,6 +512,9 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 	// Parallel / batch path.
 	if maxC <= 0 {
 		maxC = len(workloads) // 0 = unlimited
+		out.Warnf(d.opts.NodeName, "--max-concurrency=0 restarts all %d workload(s) concurrently; monitor API server and rollout capacity", maxC)
+	} else if maxC > 10 {
+		out.Warnf(d.opts.NodeName, "workload concurrency is %d; high parallelism can create API and rollout pressure", maxC)
 	}
 	totalBatches := (len(workloads) + maxC - 1) / maxC
 
@@ -489,6 +569,35 @@ func (d *Drainer) validateCheckpoint(cp *Checkpoint) error {
 		return fmt.Errorf("checkpoint is for kube context %q, not %q", cp.Context, d.opts.CheckpointContext)
 	}
 	return nil
+}
+
+func (d *Drainer) checkpointCanSkip(ctx context.Context, cp *Checkpoint, w workload.Workload) (bool, error) {
+	if !cp.IsDone(w) {
+		return false, nil
+	}
+	if meta, ok := cp.Work(w); ok {
+		if meta.UID != "" && w.UID != "" && meta.UID != string(w.UID) {
+			d.opts.Out.Warnf(wSubject(w), "checkpoint entry UID changed; restarting workload")
+			return false, nil
+		}
+		if meta.Generation != 0 && w.Generation != 0 && meta.Generation != w.Generation {
+			d.opts.Out.Warnf(wSubject(w), "checkpoint entry generation changed; restarting workload")
+			return false, nil
+		}
+		return true, nil
+	}
+
+	// Legacy checkpoints do not include workload identity. Only trust them when
+	// this workload no longer has pods on the target node.
+	hasPods, err := d.workloadHasPodsOnNode(ctx, w)
+	if err != nil {
+		return false, fmt.Errorf("validating legacy checkpoint entry for %s: %w", wSubject(w), err)
+	}
+	if hasPods {
+		d.opts.Out.Warnf(wSubject(w), "legacy checkpoint entry found but pods remain on node; restarting workload")
+		return false, nil
+	}
+	return true, nil
 }
 
 // cordon marks the node unschedulable via a strategic-merge patch so new pods
@@ -579,31 +688,36 @@ func (d *Drainer) rollingRestart(ctx context.Context, w workload.Workload) error
 		return nil
 	}
 
-	d.events.WorkloadEvent(ctx, w, "RollingRestartTriggered",
-		fmt.Sprintf("kubectl-safed: rolling restart triggered on node drain of %q", d.opts.NodeName),
-		corev1.EventTypeNormal)
+	if err := d.opts.WorkloadCoordinator.Do(ctx, w, func(ctx context.Context) error {
+		d.events.WorkloadEvent(ctx, w, "RollingRestartTriggered",
+			fmt.Sprintf("kubectl-safed: rolling restart triggered on node drain of %q", d.opts.NodeName),
+			corev1.EventTypeNormal)
 
-	switch w.Kind {
-	case workload.KindDeployment:
-		preGen, err := d.restartDeployment(ctx, w.Namespace, w.Name)
-		if err != nil {
-			return err
-		}
-		if err := d.waitForDeploymentRollout(ctx, w.Namespace, w.Name, preGen); err != nil {
-			return fmt.Errorf("deployment %s/%s rollout failed: %w", w.Namespace, w.Name, err)
-		}
+		switch w.Kind {
+		case workload.KindDeployment:
+			preGen, err := d.restartDeployment(ctx, w.Namespace, w.Name)
+			if err != nil {
+				return err
+			}
+			if err := d.waitForDeploymentRollout(ctx, w.Namespace, w.Name, preGen); err != nil {
+				return fmt.Errorf("deployment %s/%s rollout failed: %w", w.Namespace, w.Name, err)
+			}
 
-	case workload.KindStatefulSet:
-		preGen, err := d.restartStatefulSet(ctx, w.Namespace, w.Name)
-		if err != nil {
-			return err
-		}
-		if err := d.waitForStatefulSetRollout(ctx, w.Namespace, w.Name, preGen); err != nil {
-			return fmt.Errorf("StatefulSet %s/%s rollout failed: %w", w.Namespace, w.Name, err)
-		}
+		case workload.KindStatefulSet:
+			preGen, err := d.restartStatefulSet(ctx, w.Namespace, w.Name)
+			if err != nil {
+				return err
+			}
+			if err := d.waitForStatefulSetRollout(ctx, w.Namespace, w.Name, preGen); err != nil {
+				return fmt.Errorf("StatefulSet %s/%s rollout failed: %w", w.Namespace, w.Name, err)
+			}
 
-	default:
-		return fmt.Errorf("unsupported workload kind %q", w.Kind)
+		default:
+			return fmt.Errorf("unsupported workload kind %q", w.Kind)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	// Verify the node is clear of this workload's pods before moving on.
@@ -879,28 +993,17 @@ func (d *Drainer) waitForStatefulSetRollout(ctx context.Context, namespace, name
 	)
 }
 
-// waitForPodsOffNode waits until no active (non-terminal, non-terminating) pods
-// belonging to w remain on the node being drained.
-//
-// Terminating pods (DeletionTimestamp set) are excluded from the count because
-// the workload is already healthy on other nodes — the termination cleanup is
-// kubelet's responsibility and does not block the drain.
+// waitForPodsOffNode waits until no non-terminal pods belonging to w remain on
+// the node being drained. Terminating pods still count: a node is not fully clear
+// until kubelet has removed their pod objects.
 func (d *Drainer) waitForPodsOffNode(ctx context.Context, w workload.Workload) error {
 	subj := wSubject(w)
 	vacate := d.podVacateTimeout()
 	d.opts.Out.Pollf(subj, "Verifying pods have left node %q (timeout=%s)", d.opts.NodeName, vacate)
 
-	selectorStr, err := buildLabelSelectorString(w.Selector)
-	if err != nil {
-		return fmt.Errorf("building pod selector for %s: %w", w, err)
-	}
-
 	return wait.PollUntilContextTimeout(ctx, d.pollInterval(), vacate, true,
 		func(ctx context.Context) (bool, error) {
-			pods, err := d.client.CoreV1().Pods(w.Namespace).List(ctx, metav1.ListOptions{
-				LabelSelector: selectorStr,
-				FieldSelector: "spec.nodeName=" + d.opts.NodeName,
-			})
+			count, err := d.workloadPodCountOnNode(ctx, w)
 			if err != nil {
 				if isTransientAPIError(err) {
 					return false, nil // retry on next tick
@@ -908,27 +1011,45 @@ func (d *Drainer) waitForPodsOffNode(ctx context.Context, w workload.Workload) e
 				return false, err
 			}
 
-			active := 0
-			for i := range pods.Items {
-				pod := &pods.Items[i]
-				// Terminating pods are already on their way out.
-				if pod.DeletionTimestamp != nil {
-					continue
-				}
-				// Terminal pods (Succeeded/Failed) need no migration.
-				if workload.IsTerminalPod(pod) {
-					continue
-				}
-				active++
-			}
-
-			if active > 0 {
-				d.opts.Out.Pollf(subj, "%d active pod(s) still on %q, waiting", active, d.opts.NodeName)
+			if count > 0 {
+				d.opts.Out.Pollf(subj, "%d pod(s) still on %q, waiting", count, d.opts.NodeName)
 				return false, nil
 			}
 			return true, nil
 		},
 	)
+}
+
+func (d *Drainer) workloadHasPodsOnNode(ctx context.Context, w workload.Workload) (bool, error) {
+	count, err := d.workloadPodCountOnNode(ctx, w)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (d *Drainer) workloadPodCountOnNode(ctx context.Context, w workload.Workload) (int, error) {
+	selectorStr, err := buildLabelSelectorString(w.Selector)
+	if err != nil {
+		return 0, fmt.Errorf("building pod selector for %s: %w", w, err)
+	}
+	pods, err := d.client.CoreV1().Pods(w.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: selectorStr,
+		FieldSelector: "spec.nodeName=" + d.opts.NodeName,
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	count := 0
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if workload.IsTerminalPod(pod) {
+			continue
+		}
+		count++
+	}
+	return count, nil
 }
 
 // newReplicaSetSelector returns the label selector for the current (new)
@@ -1067,10 +1188,7 @@ func badWaitingReason(cs corev1.ContainerStatus) string {
 // temporary rate limiting. Transient errors in poll condition functions should
 // return (false, nil) so the poll retries rather than aborting the drain.
 func isTransientAPIError(err error) bool {
-	return k8serrors.IsInternalError(err) ||
-		k8serrors.IsServerTimeout(err) ||
-		k8serrors.IsTimeout(err) ||
-		k8serrors.IsTooManyRequests(err)
+	return k8s.IsTransientAPIError(err)
 }
 
 // retryTransient calls fn up to 3 times, retrying after interval when the
@@ -1118,8 +1236,9 @@ func (d *Drainer) evictRemaining(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listing remaining pods on %q: %w", d.opts.NodeName, err)
 	}
+	candidates := d.excludeProtectedPods(pods.Items)
 
-	blocked := blockedEvictionPods(pods.Items, d.opts.SkipDaemonSets, d.opts.Force, d.opts.DeleteEmptyDir)
+	blocked := blockedEvictionPods(candidates, d.opts.SkipDaemonSets, d.opts.Force, d.opts.DeleteEmptyDir)
 	if len(blocked) > 0 {
 		for _, b := range blocked {
 			out.Warnf(d.opts.NodeName, "Cannot evict %s/%s: %s", b.pod.Namespace, b.pod.Name, b.reason)
@@ -1130,8 +1249,12 @@ func (d *Drainer) evictRemaining(ctx context.Context) error {
 		}
 	}
 
-	evictable := filterEvictable(pods.Items, d.opts.SkipDaemonSets, d.opts.Force, d.opts.DeleteEmptyDir)
+	evictable := filterEvictable(candidates, d.opts.SkipDaemonSets, d.opts.Force, d.opts.DeleteEmptyDir)
+	waiting := podsPendingDeletion(candidates, d.opts.SkipDaemonSets)
 	if len(evictable) == 0 {
+		if len(waiting) > 0 && !d.opts.DryRun {
+			return d.waitForPodsDeleted(ctx, waiting, d.podVacateTimeout())
+		}
 		out.Infof(d.opts.NodeName, "No remaining pods to evict on %q", d.opts.NodeName)
 		return nil
 	}
@@ -1172,7 +1295,42 @@ func (d *Drainer) evictRemaining(ctx context.Context) error {
 		}
 	}
 
-	return nil
+	if d.opts.DryRun {
+		return nil
+	}
+	return d.waitForPodsDeleted(ctx, append(waiting, evictable...), d.podVacateTimeout())
+}
+
+func (d *Drainer) excludeProtectedPods(pods []corev1.Pod) []corev1.Pod {
+	if len(d.protectedWorkloads) == 0 {
+		return pods
+	}
+	out := make([]corev1.Pod, 0, len(pods))
+	for i := range pods {
+		pod := &pods[i]
+		if protected := d.protectedWorkloadForPod(pod); protected != "" {
+			d.opts.Out.Infof(d.opts.NodeName, "Leaving %s/%s untouched (%s is filtered)", pod.Namespace, pod.Name, protected)
+			continue
+		}
+		out = append(out, *pod)
+	}
+	return out
+}
+
+func (d *Drainer) protectedWorkloadForPod(pod *corev1.Pod) string {
+	for _, w := range d.protectedWorkloads {
+		if pod.Namespace != w.Namespace || w.Selector == nil {
+			continue
+		}
+		sel, err := metav1.LabelSelectorAsSelector(w.Selector)
+		if err != nil {
+			continue
+		}
+		if sel.Matches(labels.Set(pod.Labels)) {
+			return wSubject(w)
+		}
+	}
+	return ""
 }
 
 // evictWithPDBRetry calls EvictV1 and retries when the eviction is temporarily
@@ -1267,6 +1425,71 @@ func filterEvictable(pods []corev1.Pod, skipDaemonSets, force, deleteEmptyDir bo
 		out = append(out, *pod)
 	}
 	return out
+}
+
+func podsPendingDeletion(pods []corev1.Pod, skipDaemonSets bool) []corev1.Pod {
+	var out []corev1.Pod
+	for i := range pods {
+		pod := &pods[i]
+		if pod.DeletionTimestamp == nil || workload.IsTerminalPod(pod) || isMirrorPod(pod) {
+			continue
+		}
+		if isDaemonSetPod(pod) && skipDaemonSets {
+			continue
+		}
+		out = append(out, *pod)
+	}
+	return out
+}
+
+func (d *Drainer) waitForPodsDeleted(ctx context.Context, pods []corev1.Pod, timeout time.Duration) error {
+	if len(pods) == 0 {
+		return nil
+	}
+	seen := make(map[types.UID]corev1.Pod, len(pods))
+	for i := range pods {
+		pod := pods[i]
+		if pod.UID != "" {
+			seen[pod.UID] = pod
+			continue
+		}
+		// Tests sometimes omit UIDs; synthesize a stable key from namespace/name.
+		pod.UID = types.UID(pod.Namespace + "/" + pod.Name)
+		seen[pod.UID] = pod
+	}
+	d.opts.Out.Pollf(d.opts.NodeName, "Waiting for %d pod(s) to be deleted from %q (timeout=%s)", len(seen), d.opts.NodeName, timeout)
+	return wait.PollUntilContextTimeout(ctx, d.pollInterval(), timeout, true,
+		func(ctx context.Context) (bool, error) {
+			remaining := 0
+			for uid, pod := range seen {
+				current, err := d.client.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+				if k8serrors.IsNotFound(err) {
+					delete(seen, uid)
+					continue
+				}
+				if err != nil {
+					if isTransientAPIError(err) {
+						return false, nil
+					}
+					return false, err
+				}
+				if current.UID != "" && pod.UID != "" && current.UID != pod.UID {
+					delete(seen, uid)
+					continue
+				}
+				if workload.IsTerminalPod(current) {
+					delete(seen, uid)
+					continue
+				}
+				remaining++
+			}
+			if remaining > 0 {
+				d.opts.Out.Pollf(d.opts.NodeName, "%d pod(s) still deleting on %q", remaining, d.opts.NodeName)
+				return false, nil
+			}
+			return true, nil
+		},
+	)
 }
 
 type blockedEvictionPod struct {

@@ -7,6 +7,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/pbsladek/k8s-safed/pkg/workload"
 )
@@ -114,8 +115,9 @@ func (d *Drainer) runPreflight(ctx context.Context, workloads []workload.Workloa
 		}
 	}
 
-	// Check PDBs with zero disruptions allowed across all namespaces that
-	// have workloads on this node. These may block the eviction step.
+	// Check PDBs with zero disruptions allowed across related workloads only.
+	// Namespace-wide warnings are noisy in shared namespaces and often unrelated
+	// to the node drain.
 	for _, ns := range uniqueNamespaces(workloads) {
 		pdbs, err := d.client.PolicyV1().PodDisruptionBudgets(ns).List(ctx, metav1.ListOptions{})
 		if err != nil {
@@ -124,7 +126,7 @@ func (d *Drainer) runPreflight(ctx context.Context, workloads []workload.Workloa
 		}
 		for i := range pdbs.Items {
 			pdb := &pdbs.Items[i]
-			if pdb.Status.DisruptionsAllowed == 0 {
+			if pdb.Status.DisruptionsAllowed == 0 && pdbMaySelectWorkload(pdb.Spec.Selector, workloadsInNamespace(workloads, ns)) {
 				issues = append(issues, preflightIssue{
 					subject: fmt.Sprintf("PodDisruptionBudget/%s/%s", ns, pdb.Name),
 					message: "0 disruptions currently allowed — eviction of remaining pods may be blocked until the PDB permits it",
@@ -255,4 +257,47 @@ func uniqueNamespaces(workloads []workload.Workload) []string {
 		}
 	}
 	return out
+}
+
+func workloadsInNamespace(workloads []workload.Workload, namespace string) []workload.Workload {
+	var out []workload.Workload
+	for _, w := range workloads {
+		if w.Namespace == namespace {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+func pdbMaySelectWorkload(pdbSelector *metav1.LabelSelector, workloads []workload.Workload) bool {
+	if pdbSelector == nil {
+		return false
+	}
+	pdbSel, err := metav1.LabelSelectorAsSelector(pdbSelector)
+	if err != nil || pdbSel.Empty() {
+		return true
+	}
+	for _, w := range workloads {
+		if w.Selector == nil {
+			continue
+		}
+		if selectorMayMatchWorkload(pdbSel, w.Selector) {
+			return true
+		}
+	}
+	return false
+}
+
+func selectorMayMatchWorkload(pdbSel labels.Selector, workloadSelector *metav1.LabelSelector) bool {
+	workloadLabels := labels.Set(workloadSelector.MatchLabels)
+	if pdbSel.Matches(workloadLabels) {
+		return true
+	}
+	pdbReqs, _ := pdbSel.Requirements()
+	for _, req := range pdbReqs {
+		if value, ok := workloadSelector.MatchLabels[req.Key()]; ok && !req.Matches(labels.Set{req.Key(): value}) {
+			return false
+		}
+	}
+	return true
 }

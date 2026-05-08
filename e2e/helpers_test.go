@@ -108,6 +108,16 @@ func dumpHelm(t *testing.T, ctx context.Context, label string, args ...string) {
 	writeArtifact(artifactName, out)
 }
 
+func cleanupManifest(t *testing.T, manifest string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	if err := framework.DeleteManifest(ctx, testCluster.KubeconfigPath, manifest); err != nil {
+		t.Errorf("cleanup manifest failed: %v", err)
+		dumpDiagnostics(t)
+	}
+}
+
 var artifactNamePattern = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
 func safeArtifactName(name string) string {
@@ -142,9 +152,9 @@ func waitAllReady(t *testing.T) {
 }
 
 // agentNodeWithPod returns an agent node that currently has a running pod
-// matching labelSelector. If no agent node qualifies the test is skipped —
-// this is a valid cluster state (e.g. scheduler placed the pod on the server
-// node), not a test failure.
+// matching labelSelector. Core e2e coverage depends on these workloads being
+// present on agent nodes, so absence is a test failure with diagnostics rather
+// than a skip.
 func agentNodeWithPod(t *testing.T, labelSelector string) string {
 	t.Helper()
 	registerDiagnostics(t)
@@ -152,7 +162,7 @@ func agentNodeWithPod(t *testing.T, labelSelector string) string {
 	defer cancel()
 	node, err := framework.AgentNodeWithPod(ctx, testClient, testCluster, framework.E2ENamespace, labelSelector)
 	if err != nil {
-		t.Skipf("skipping: %v", err)
+		t.Fatalf("no agent node has a running pod matching %q: %v", labelSelector, err)
 	}
 	return node
 }
