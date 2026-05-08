@@ -19,6 +19,7 @@ Useful environment variables:
 | `SAFED_E2E_CLUSTER_NAME` | `safed-e2e` | k3d cluster name. |
 | `SAFED_E2E_FLANNEL_BACKEND` | `host-gw` | k3s flannel backend. Set empty to use k3s default. |
 | `SAFED_E2E_ARTIFACT_DIR` | `/tmp/safed-e2e-diagnostics` | Directory for per-test diagnostics artifacts. |
+| `SAFED_E2E_GO` | `go` | Go binary used by the e2e harness when building `kubectl-safed`. Make sets this to the repo-pinned mise Go when available. |
 | `SAFED_E2E_STREAM` | | Stream drain command output while tests run. |
 | `K3S_IMAGE` | | Optional k3s image passed to k3d. |
 
@@ -40,6 +41,7 @@ so editor tooling can load helper files such as `framework/helm.go`.
 | `make e2e-checkpoint` | Checkpoint creation, validation, resume, timeout, and corrupt-file handling. |
 | `make e2e-observability` | JSON logs, event emission, skip output, and status formatting. |
 | `make e2e-nodes` | Multi-node selection, deduplication, and selector behavior. |
+| `make e2e-focused` | Recently added edge cases for config, checkpoint, RBAC, node concurrency, and deletion races. |
 
 ## Coverage Matrix
 
@@ -51,5 +53,6 @@ so editor tooling can load helper files such as `framework/helm.go`.
 | Checkpoint/resume | Completed workload skip, killed process resume, global timeout persistence, wrong-node validation, corrupt checkpoint rejection before cordon. |
 | RBAC | Missing node patch, missing workload patch, missing pod eviction, missing events create as best-effort warning. |
 | Config | Defaults, built-in modes, named profiles, CLI override, unknown fields, env config, explicit `--config` precedence. |
-| Failure handling | CrashLoop detection, rollout timeout, uncordon-on-failure, dry-run no-mutation behavior. |
+| Multi-node | Selector targeting, node de-duplication, parallel node drains, partial failure cleanup with `--node-concurrency`. |
+| Failure handling | CrashLoop detection, rollout timeout, uncordon-on-failure, already-cordoned no-op behavior, dry-run no-mutation behavior. |
 | Observability | Human output, JSON output, Kubernetes events, diagnostics logs and artifact files on setup/test failures. |

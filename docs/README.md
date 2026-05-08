@@ -11,6 +11,8 @@ Start here:
   reference, RBAC, profiles, logging, checkpoints, and edge cases.
 - [Examples](examples/README.md): real-world drain commands and reusable
   profile/RBAC examples.
+- [Development](development.md): mise-based local toolchain setup and test
+  commands.
 - [Project README](../README.md): short project overview, release, and
   contribution notes.
 

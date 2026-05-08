@@ -191,3 +191,35 @@ func TestDrain_MultiNode(t *testing.T) {
 		t.Fatalf("test workload not healthy after multi-node drain: %v", err)
 	}
 }
+
+// --------------------------------------------------------------------------
+// TestDrain_MultiNodePartialFailureUncordonsFailedNodeOnly
+// --------------------------------------------------------------------------
+
+func TestDrain_MultiNodePartialFailureUncordonsFailedNodeOnly(t *testing.T) {
+	waitAllReady(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	target := firstAgentNode(t, ctx)
+	uncordon(t, target)
+	defer uncordon(t, target)
+
+	result := testBinary.DrainNodes(ctx, []string{target, "safed-e2e-missing-node"},
+		"--preflight", "off",
+		"--node-concurrency", "2",
+		"--uncordon-on-failure",
+		"--poll-interval", "1s",
+	)
+	if result.Err == nil {
+		t.Fatal("multi-node drain should fail when one target node does not exist")
+	}
+	verifyNodeNotCordoned(t, target)
+
+	combined := result.Stdout + result.Stderr + result.Err.Error()
+	if !strings.Contains(combined, "safed-e2e-missing-node") {
+		t.Fatalf("multi-node partial failure output missing missing-node context\nerr: %v\nstdout: %s\nstderr: %s",
+			result.Err, result.Stdout, result.Stderr)
+	}
+}

@@ -117,6 +117,17 @@ func TestDrain_RBACMissingPodEvictionUncordonsAfterFailure(t *testing.T) {
 	uncordon(t, target)
 	defer uncordon(t, target)
 
+	manifest := framework.StandalonePodManifest(framework.E2ENamespace, "rbac-no-pod-eviction", false)
+	defer func() {
+		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, manifest)
+	}()
+	withOnlyNodeSchedulable(t, ctx, target, func() {
+		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, manifest); err != nil {
+			t.Fatalf("apply pod eviction test pod: %v", err)
+		}
+		waitForPodWithSelectorOnNode(t, ctx, target, framework.E2ENamespace, "app=rbac-no-pod-eviction", workloadReady)
+	})
+
 	kubeconfigPath := restrictedDrainKubeconfig(t, ctx, "no-pod-eviction", []rbacv1.PolicyRule{
 		{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"get", "patch"}},
 		{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"list", "get"}},
@@ -129,7 +140,9 @@ func TestDrain_RBACMissingPodEvictionUncordonsAfterFailure(t *testing.T) {
 
 	result := restricted.Drain(ctx, target,
 		"--preflight", "off",
-		"--only-workload", "Deployment/e2e/does-not-exist",
+		"--skip-workload", "Deployment/e2e/grafana",
+		"--skip-workload", "StatefulSet/e2e/nats",
+		"--skip-workload", "Deployment/e2e/kube-state-metrics",
 		"--force",
 		"--uncordon-on-failure",
 		"--eviction-timeout", "20s",
@@ -187,6 +200,43 @@ func TestDrain_RBACMissingEventCreateIsBestEffort(t *testing.T) {
 
 	if !strings.Contains(result.Stdout+result.Stderr, `failed to emit event "Draining"`) {
 		t.Fatalf("output missing best-effort event warning\nstdout: %s\nstderr: %s", result.Stdout, result.Stderr)
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestDrain_RBACNamespacedPodListFailsBeforeMutation
+// --------------------------------------------------------------------------
+
+func TestDrain_RBACNamespacedPodListFailsBeforeMutation(t *testing.T) {
+	waitAllReady(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	target := firstAgentNode(t, ctx)
+	uncordon(t, target)
+	defer uncordon(t, target)
+
+	kubeconfigPath := namespaceScopedDrainKubeconfig(t, ctx, "namespace-only")
+	restricted := &framework.Binary{
+		Path:           testBinary.Path,
+		KubeconfigPath: kubeconfigPath,
+	}
+
+	result := restricted.Drain(ctx, target,
+		"--preflight", "off",
+		"--poll-interval", "1s",
+	)
+	if result.Err == nil {
+		t.Fatalf("namespace-scoped drain should fail when listing pods cluster-wide\nstdout: %s\nstderr: %s",
+			result.Stdout, result.Stderr)
+	}
+	verifyNodeNotCordoned(t, target)
+
+	combined := result.Stdout + result.Stderr + result.Err.Error()
+	if !strings.Contains(combined, "forbidden") || !strings.Contains(combined, "listing pods") {
+		t.Fatalf("namespace-scoped drain failed for unexpected reason\nerr: %v\nstdout: %s\nstderr: %s",
+			result.Err, result.Stdout, result.Stderr)
 	}
 }
 
@@ -253,6 +303,89 @@ func restrictedDrainKubeconfig(t *testing.T, ctx context.Context, suffix string,
 	if err != nil {
 		t.Fatalf("create restricted cluster role binding: %v", err)
 	}
+
+	return serviceAccountKubeconfig(t, ctx, ns, name)
+}
+
+func namespaceScopedDrainKubeconfig(t *testing.T, ctx context.Context, suffix string) string {
+	t.Helper()
+
+	name := k8sTestName(t, suffix)
+	ns := framework.E2ENamespace
+	_, err := testClient.CoreV1().ServiceAccounts(ns).Create(ctx, &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create namespace-scoped service account: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = testClient.RbacV1().ClusterRoleBindings().Delete(context.Background(), name+"-nodes", metav1.DeleteOptions{})
+		_ = testClient.RbacV1().ClusterRoles().Delete(context.Background(), name+"-nodes", metav1.DeleteOptions{})
+		_ = testClient.RbacV1().RoleBindings(ns).Delete(context.Background(), name, metav1.DeleteOptions{})
+		_ = testClient.RbacV1().Roles(ns).Delete(context.Background(), name, metav1.DeleteOptions{})
+		_ = testClient.CoreV1().ServiceAccounts(ns).Delete(context.Background(), name, metav1.DeleteOptions{})
+	})
+
+	_, err = testClient.RbacV1().ClusterRoles().Create(ctx, &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: name + "-nodes"},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{""},
+			Resources: []string{"nodes"},
+			Verbs:     []string{"get", "patch"},
+		}},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create namespace-scoped node cluster role: %v", err)
+	}
+	_, err = testClient.RbacV1().ClusterRoleBindings().Create(ctx, &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: name + "-nodes"},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "ClusterRole",
+			Name:     name + "-nodes",
+		},
+		Subjects: []rbacv1.Subject{{
+			Kind:      rbacv1.ServiceAccountKind,
+			Name:      name,
+			Namespace: ns,
+		}},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create namespace-scoped node cluster role binding: %v", err)
+	}
+
+	_, err = testClient.RbacV1().Roles(ns).Create(ctx, &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Rules: []rbacv1.PolicyRule{
+			{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"list", "get"}},
+			{APIGroups: []string{"apps"}, Resources: []string{"deployments", "replicasets", "statefulsets"}, Verbs: []string{"get", "patch"}},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create namespace-scoped role: %v", err)
+	}
+	_, err = testClient.RbacV1().RoleBindings(ns).Create(ctx, &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "Role",
+			Name:     name,
+		},
+		Subjects: []rbacv1.Subject{{
+			Kind:      rbacv1.ServiceAccountKind,
+			Name:      name,
+			Namespace: ns,
+		}},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("create namespace-scoped role binding: %v", err)
+	}
+
+	return serviceAccountKubeconfig(t, ctx, ns, name)
+}
+
+func serviceAccountKubeconfig(t *testing.T, ctx context.Context, ns, name string) string {
+	t.Helper()
 
 	expirationSeconds := int64(10 * 60)
 	token, err := testClient.CoreV1().ServiceAccounts(ns).CreateToken(ctx, name, &authv1.TokenRequest{

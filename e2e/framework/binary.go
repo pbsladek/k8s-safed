@@ -164,12 +164,16 @@ func BuildBinary(moduleRoot string) (string, error) {
 	}
 
 	binPath := filepath.Join(dir, "kubectl-safed")
-	cmd := exec.Command("go", "build", "-o", binPath, ".")
+	goBin := os.Getenv("SAFED_E2E_GO")
+	if goBin == "" {
+		goBin = "go"
+	}
+	cmd := exec.Command(goBin, "build", "-o", binPath, ".")
 	cmd.Dir = moduleRoot
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("go build: %w", err)
+		return "", fmt.Errorf("%s build: %w", goBin, err)
 	}
 	return binPath, nil
 }

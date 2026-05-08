@@ -136,6 +136,47 @@ func TestDrain_CorruptCheckpointFailsBeforeCordon(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// TestDrain_CheckpointResumeRejectsContextMismatchBeforeCordon
+// --------------------------------------------------------------------------
+
+func TestDrain_CheckpointResumeRejectsContextMismatchBeforeCordon(t *testing.T) {
+	waitAllReady(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	target := firstAgentNode(t, ctx)
+	uncordon(t, target)
+	defer uncordon(t, target)
+
+	cpPath := filepath.Join(t.TempDir(), "wrong-context.json")
+	cpData := mustJSONPatch(t, drainpkg.Checkpoint{
+		NodeName:  target,
+		Context:   "not-the-current-context",
+		Completed: map[string]bool{},
+	})
+	if err := os.WriteFile(cpPath, cpData, 0600); err != nil {
+		t.Fatalf("write wrong-context checkpoint: %v", err)
+	}
+
+	result := testBinary.Drain(ctx, target,
+		"--resume",
+		"--checkpoint-path", cpPath,
+		"--preflight", "off",
+		"--poll-interval", "1s",
+	)
+	if result.Err == nil {
+		t.Fatal("resume with a checkpoint for the wrong kube context must fail")
+	}
+	combined := result.Stdout + result.Stderr + result.Err.Error()
+	if !strings.Contains(combined, "checkpoint is for kube context") {
+		t.Fatalf("wrong-context checkpoint failed with unexpected error: %v\nstdout: %s\nstderr: %s",
+			result.Err, result.Stdout, result.Stderr)
+	}
+	verifyNodeNotCordoned(t, target)
+}
+
+// --------------------------------------------------------------------------
 // TestDrain_CheckpointResumeAfterProcessKill
 // --------------------------------------------------------------------------
 

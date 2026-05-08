@@ -25,6 +25,7 @@ env:
   KUBECTL_VERSION: v1.35.3
   HELM_VERSION: v3.16.4
   SAFED_E2E_CLUSTER_NAME: safed-e2e-ci
+  SAFED_E2E_UPLOAD_ARTIFACTS: "false"
 
 jobs:
   e2e:
@@ -92,7 +93,7 @@ jobs:
           SAFED_E2E_CLUSTER_NAME: ${{ env.SAFED_E2E_CLUSTER_NAME }}
 
       - name: Upload diagnostics
-        if: failure()
+        if: ${{ failure() || env.SAFED_E2E_UPLOAD_ARTIFACTS == 'true' }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: e2e-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}

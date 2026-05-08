@@ -135,3 +135,49 @@ func TestDrain_UncordonOnFailure(t *testing.T) {
 	// --uncordon-on-failure must restore the node to schedulable.
 	verifyNodeNotCordoned(t, target)
 }
+
+// --------------------------------------------------------------------------
+// TestDrain_AlreadyCordonedFailureDoesNotUncordon
+// --------------------------------------------------------------------------
+
+func TestDrain_AlreadyCordonedFailureDoesNotUncordon(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancel()
+
+	target := firstAgentNode(t, ctx)
+	defer func() {
+		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.CrashingDeploymentManifest)
+	}()
+	withOnlyNodeSchedulable(t, ctx, target, func() {
+		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, framework.CrashingDeploymentManifest); err != nil {
+			t.Fatalf("apply crashing deployment: %v", err)
+		}
+		got, err := framework.WaitForCrashingPod(ctx, testClient, framework.E2ENamespace,
+			framework.CrasherPodSelector, 90*time.Second)
+		if err != nil {
+			t.Fatalf("crashing pod did not crash within timeout: %v", err)
+		}
+		if got != target {
+			t.Fatalf("crashing pod scheduled on %s, want %s", got, target)
+		}
+	})
+
+	if err := framework.CordonNode(ctx, testCluster.KubeconfigPath, target); err != nil {
+		t.Fatalf("cordon target before drain: %v", err)
+	}
+	defer uncordon(t, target)
+
+	result := testBinary.Drain(ctx, target,
+		"--rollout-timeout", "3m",
+		"--uncordon-on-failure",
+	)
+	if result.Err == nil {
+		t.Fatal("drain should fail on CrashLoopBackOff")
+	}
+	verifyNodeCordoned(t, target)
+
+	if !strings.Contains(result.Stdout+result.Stderr, "--uncordon-on-failure has no effect") {
+		t.Fatalf("output missing already-cordoned uncordon warning\nstdout: %s\nstderr: %s",
+			result.Stdout, result.Stderr)
+	}
+}
