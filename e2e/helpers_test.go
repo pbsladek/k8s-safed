@@ -5,7 +5,11 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -47,6 +51,7 @@ func registerDiagnostics(t *testing.T) {
 	if _, loaded := diagnosticsRegistered.LoadOrStore(t.Name(), struct{}{}); loaded {
 		return
 	}
+	fmt.Fprintf(os.Stderr, "[e2e] START %s\n", t.Name())
 	t.Cleanup(func() {
 		diagnosticsRegistered.Delete(t.Name())
 		if t.Failed() {
@@ -63,8 +68,14 @@ func dumpDiagnostics(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	dumpKubectl(t, ctx, "nodes", "get", "nodes", "-o", "wide")
+	dumpKubectl(t, ctx, "describe-nodes", "describe", "nodes")
 	dumpKubectl(t, ctx, "pods", "get", "pods", "-A", "-o", "wide")
+	dumpKubectl(t, ctx, "describe-pods", "describe", "pods", "-A")
 	dumpKubectl(t, ctx, "events", "get", "events", "-A", "--sort-by=.lastTimestamp")
+	dumpHelm(t, ctx, "helm-list", "list", "-A")
+	for _, release := range []string{"nats", "grafana", "kube-state-metrics"} {
+		dumpHelm(t, ctx, "helm-status-"+release, "status", release, "--namespace", framework.E2ENamespace)
+	}
 }
 
 func dumpKubectl(t *testing.T, ctx context.Context, label string, args ...string) {
@@ -72,11 +83,49 @@ func dumpKubectl(t *testing.T, ctx context.Context, label string, args ...string
 	allArgs := append([]string{"--kubeconfig", testCluster.KubeconfigPath}, args...)
 	cmd := exec.CommandContext(ctx, "kubectl", allArgs...)
 	out, err := cmd.CombinedOutput()
+	artifactName := safeArtifactName(t.Name() + "-" + label + ".txt")
 	if err != nil {
 		t.Logf("[diagnostics] kubectl %s failed: %v\n%s", label, err, out)
+		writeArtifact(artifactName, out)
 		return
 	}
 	t.Logf("[diagnostics] kubectl %s:\n%s", label, out)
+	writeArtifact(artifactName, out)
+}
+
+func dumpHelm(t *testing.T, ctx context.Context, label string, args ...string) {
+	t.Helper()
+	allArgs := append([]string{"--kubeconfig", testCluster.KubeconfigPath}, args...)
+	cmd := exec.CommandContext(ctx, "helm", allArgs...)
+	out, err := cmd.CombinedOutput()
+	artifactName := safeArtifactName(t.Name() + "-" + label + ".txt")
+	if err != nil {
+		t.Logf("[diagnostics] helm %s failed: %v\n%s", label, err, out)
+		writeArtifact(artifactName, out)
+		return
+	}
+	t.Logf("[diagnostics] helm %s:\n%s", label, out)
+	writeArtifact(artifactName, out)
+}
+
+var artifactNamePattern = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+func safeArtifactName(name string) string {
+	return artifactNamePattern.ReplaceAllString(name, "_")
+}
+
+func writeArtifact(name string, data []byte) {
+	if artifactDir == "" || len(data) == 0 {
+		return
+	}
+	if err := os.MkdirAll(artifactDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "[e2e] write artifact mkdir: %v\n", err)
+		return
+	}
+	path := filepath.Join(artifactDir, safeArtifactName(name))
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "[e2e] write artifact %s: %v\n", path, err)
+	}
 }
 
 // waitAllReady blocks until NATS and Grafana are fully healthy. Call this at

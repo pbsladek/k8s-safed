@@ -74,9 +74,15 @@ jobs:
         run: go mod download
 
       - name: Run E2E tests
-        run: go test -v -tags=e2e -count=1 -timeout=30m ./e2e/...
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            make e2e-core E2E_TIMEOUT=30m
+          else
+            make e2e-full E2E_TIMEOUT=35m
+          fi
         env:
           SAFED_E2E_CLUSTER_NAME: ${{ env.SAFED_E2E_CLUSTER_NAME }}
+          SAFED_E2E_ARTIFACT_DIR: /tmp/safed-e2e-diagnostics
 
       - name: Collect diagnostics on failure
         if: failure()

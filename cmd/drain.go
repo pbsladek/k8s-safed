@@ -394,7 +394,7 @@ func effectiveKubeContext() (string, error) {
 
 var builtinDrainModes = map[string]config.Profile{
 	"prod": {
-		Preflight:         string(drain.PreflightModeStrict),
+		Preflight:         config.PreflightMode(drain.PreflightModeStrict),
 		Timeout:           durationPtr(45 * time.Minute),
 		MaxConcurrency:    intPtr(1),
 		NodeConcurrency:   intPtr(1),
@@ -402,7 +402,7 @@ var builtinDrainModes = map[string]config.Profile{
 		EmitEvents:        boolPtr(true),
 	},
 	"scale-down": {
-		Preflight:         string(drain.PreflightModeWarn),
+		Preflight:         config.PreflightMode(drain.PreflightModeWarn),
 		RolloutTimeout:    durationPtr(6 * time.Minute),
 		PodVacateTimeout:  durationPtr(2 * time.Minute),
 		EvictionTimeout:   durationPtr(2 * time.Minute),
@@ -411,7 +411,7 @@ var builtinDrainModes = map[string]config.Profile{
 		UncordonOnFailure: boolPtr(true),
 	},
 	"debug": {
-		Preflight:    string(drain.PreflightModeWarn),
+		Preflight:    config.PreflightMode(drain.PreflightModeWarn),
 		DryRun:       boolPtr(true),
 		PollInterval: durationPtr(1 * time.Second),
 		Timeout:      durationPtr(10 * time.Minute),
@@ -511,7 +511,7 @@ func applyProfileValues(cmd *cobra.Command, opts *drainOptions, prof config.Prof
 		opts.nodeConcurrency = *prof.NodeConcurrency
 	}
 	if prof.Preflight != "" && !changed("preflight") {
-		opts.preflight = prof.Preflight
+		opts.preflight = string(prof.Preflight)
 	}
 	if prof.LogFormat != "" && !changed("log-format") {
 		opts.logFormat = prof.LogFormat

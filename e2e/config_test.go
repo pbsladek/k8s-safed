@@ -139,6 +139,67 @@ profiles:
 }
 
 // --------------------------------------------------------------------------
+// TestDrain_ConfigEnvAndExplicitConfigPrecedence
+// --------------------------------------------------------------------------
+
+func TestDrain_ConfigEnvAndExplicitConfigPrecedence(t *testing.T) {
+	waitAllReady(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancel()
+
+	target := firstAgentNode(t, ctx)
+	defer uncordon(t, target)
+	defer func() {
+		_ = framework.DeleteManifest(context.Background(), testCluster.KubeconfigPath, framework.WorkerManifest)
+	}()
+	deployDeploymentsOnNode(t, ctx, target, framework.WorkerManifest, "worker")
+
+	dir := t.TempDir()
+	envConfigPath := filepath.Join(dir, "env-safed.yaml")
+	envConfigData := []byte(`defaults:
+  preflight: strict
+  poll-interval: 1s
+`)
+	if err := os.WriteFile(envConfigPath, envConfigData, 0600); err != nil {
+		t.Fatalf("write env config: %v", err)
+	}
+	t.Setenv("KUBECTL_SAFED_CONFIG", envConfigPath)
+
+	fromEnv := testBinary.Drain(ctx, target,
+		"--only-workload", "Deployment/e2e/worker",
+		"--timeout", "20s",
+	)
+	if fromEnv.Err == nil {
+		t.Fatal("env config preflight=strict must abort on single-replica worker")
+	}
+	verifyNodeNotCordoned(t, target)
+
+	explicitConfigPath := filepath.Join(dir, "explicit-safed.yaml")
+	explicitConfigData := []byte(`defaults:
+  preflight: off
+  dry-run: true
+  poll-interval: 1s
+`)
+	if err := os.WriteFile(explicitConfigPath, explicitConfigData, 0600); err != nil {
+		t.Fatalf("write explicit config: %v", err)
+	}
+
+	explicit := testBinary.Drain(ctx, target,
+		"--config", explicitConfigPath,
+		"--only-workload", "Deployment/e2e/worker",
+	)
+	if explicit.Err != nil {
+		t.Fatalf("explicit --config should override KUBECTL_SAFED_CONFIG: %v\nstdout: %s\nstderr: %s",
+			explicit.Err, explicit.Stdout, explicit.Stderr)
+	}
+	if !strings.Contains(explicit.Stdout, "Dry-run complete") {
+		t.Fatalf("explicit config output missing dry-run confirmation\nstdout: %s\nstderr: %s", explicit.Stdout, explicit.Stderr)
+	}
+	verifyNodeNotCordoned(t, target)
+}
+
+// --------------------------------------------------------------------------
 // TestDrain_ConfigValidationAndModeErrors
 // --------------------------------------------------------------------------
 

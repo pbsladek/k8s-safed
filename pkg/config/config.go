@@ -59,28 +59,50 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// PreflightMode is a string-like config value. YAML 1.1 parsers commonly
+// coerce the unquoted scalar "off" to boolean false, so accept false as the
+// intended "off" mode.
+type PreflightMode string
+
+func (p *PreflightMode) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		*p = PreflightMode(s)
+		return nil
+	}
+	var enabled bool
+	if err := json.Unmarshal(b, &enabled); err == nil {
+		if !enabled {
+			*p = PreflightMode("off")
+			return nil
+		}
+		return fmt.Errorf("preflight must be a string mode, got true")
+	}
+	return fmt.Errorf("preflight must be a string mode, got %s", b)
+}
+
 // Profile holds per-profile flag overrides. Pointer fields let the profile
 // system distinguish "not set in profile" from "explicitly set to zero value"
 // so that CLI flags always win over profile defaults.
 type Profile struct {
-	Timeout               *Duration `json:"timeout,omitempty"`
-	RolloutTimeout        *Duration `json:"rollout-timeout,omitempty"`
-	PodVacateTimeout      *Duration `json:"pod-vacate-timeout,omitempty"`
-	EvictionTimeout       *Duration `json:"eviction-timeout,omitempty"`
-	PDBRetryInterval      *Duration `json:"pdb-retry-interval,omitempty"`
-	PollInterval          *Duration `json:"poll-interval,omitempty"`
-	MaxConcurrency        *int      `json:"max-concurrency,omitempty"`
-	NodeConcurrency       *int      `json:"node-concurrency,omitempty"`
-	Preflight             string    `json:"preflight,omitempty"`
-	LogFormat             string    `json:"log-format,omitempty"`
-	DryRun                *bool     `json:"dry-run,omitempty"`
-	Force                 *bool     `json:"force,omitempty"`
-	IgnoreDaemonSets      *bool     `json:"ignore-daemonsets,omitempty"`
-	DeleteEmptyDir        *bool     `json:"delete-emptydir-data,omitempty"`
-	ForceDeleteStandalone *bool     `json:"force-delete-standalone,omitempty"`
-	UncordonOnFailure     *bool     `json:"uncordon-on-failure,omitempty"`
-	EmitEvents            *bool     `json:"emit-events,omitempty"`
-	StatefulNamePatterns  []string  `json:"stateful-name-patterns,omitempty"`
+	Timeout               *Duration     `json:"timeout,omitempty"`
+	RolloutTimeout        *Duration     `json:"rollout-timeout,omitempty"`
+	PodVacateTimeout      *Duration     `json:"pod-vacate-timeout,omitempty"`
+	EvictionTimeout       *Duration     `json:"eviction-timeout,omitempty"`
+	PDBRetryInterval      *Duration     `json:"pdb-retry-interval,omitempty"`
+	PollInterval          *Duration     `json:"poll-interval,omitempty"`
+	MaxConcurrency        *int          `json:"max-concurrency,omitempty"`
+	NodeConcurrency       *int          `json:"node-concurrency,omitempty"`
+	Preflight             PreflightMode `json:"preflight,omitempty"`
+	LogFormat             string        `json:"log-format,omitempty"`
+	DryRun                *bool         `json:"dry-run,omitempty"`
+	Force                 *bool         `json:"force,omitempty"`
+	IgnoreDaemonSets      *bool         `json:"ignore-daemonsets,omitempty"`
+	DeleteEmptyDir        *bool         `json:"delete-emptydir-data,omitempty"`
+	ForceDeleteStandalone *bool         `json:"force-delete-standalone,omitempty"`
+	UncordonOnFailure     *bool         `json:"uncordon-on-failure,omitempty"`
+	EmitEvents            *bool         `json:"emit-events,omitempty"`
+	StatefulNamePatterns  []string      `json:"stateful-name-patterns,omitempty"`
 }
 
 // Config is the top-level structure of the safed config file.

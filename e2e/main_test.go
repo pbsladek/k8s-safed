@@ -35,6 +35,7 @@ var (
 	testCluster *framework.Cluster
 	testClient  kubernetes.Interface
 	testBinary  *framework.Binary
+	artifactDir string
 )
 
 func moduleRoot() string {
@@ -49,6 +50,16 @@ func TestMain(m *testing.M) {
 func runTests(m *testing.M) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 33*time.Minute)
 	defer cancel()
+
+	artifactDir = os.Getenv("SAFED_E2E_ARTIFACT_DIR")
+	if artifactDir == "" {
+		artifactDir = filepath.Join(os.TempDir(), "safed-e2e-diagnostics")
+	}
+	if err := os.MkdirAll(artifactDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "[e2e] create artifact dir %s: %v\n", artifactDir, err)
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "[e2e] Diagnostics artifacts: %s\n", artifactDir)
 
 	// ── Build binary ──────────────────────────────────────────────────────────
 	fmt.Fprintln(os.Stderr, "[e2e] Building kubectl-safed...")
@@ -86,7 +97,9 @@ func runTests(m *testing.M) int {
 
 	// ── Cluster baseline ──────────────────────────────────────────────────────
 	fmt.Fprintln(os.Stderr, "[e2e] Waiting for cluster addons to be ready...")
-	if err := framework.WaitForClusterAddons(ctx, client, 3*time.Minute); err != nil {
+	if err := retrySetup(ctx, "wait for cluster addons", 3, func() error {
+		return framework.WaitForClusterAddons(ctx, client, 3*time.Minute)
+	}); err != nil {
 		fmt.Fprintf(os.Stderr, "[e2e] cluster addons not ready: %v\n", err)
 		dumpSetupDiagnostics(testCluster.KubeconfigPath)
 		return 1
@@ -100,7 +113,9 @@ func runTests(m *testing.M) int {
 
 	// ── Helm repos ────────────────────────────────────────────────────────────
 	fmt.Fprintln(os.Stderr, "[e2e] Setting up Helm repos...")
-	if err := framework.HelmSetupRepos(ctx); err != nil {
+	if err := retrySetup(ctx, "helm repo setup", 3, func() error {
+		return framework.HelmSetupRepos(ctx)
+	}); err != nil {
 		fmt.Fprintf(os.Stderr, "[e2e] helm repo setup: %v\n", err)
 		return 1
 	}
@@ -113,7 +128,9 @@ func runTests(m *testing.M) int {
 	}
 	for _, r := range releases {
 		fmt.Fprintf(os.Stderr, "[e2e] Installing %s (%s)...\n", r.ReleaseName, r.Chart)
-		if err := framework.HelmInstall(ctx, testCluster.KubeconfigPath, r); err != nil {
+		if err := retrySetup(ctx, "helm install "+r.ReleaseName, 2, func() error {
+			return framework.HelmInstall(ctx, testCluster.KubeconfigPath, r)
+		}); err != nil {
 			fmt.Fprintf(os.Stderr, "[e2e] helm install %s: %v\n", r.ReleaseName, err)
 			dumpSetupDiagnostics(testCluster.KubeconfigPath)
 			return 1
@@ -122,7 +139,9 @@ func runTests(m *testing.M) int {
 
 	// ── Wait for all workloads to settle ──────────────────────────────────────
 	fmt.Fprintln(os.Stderr, "[e2e] Waiting for workloads to be ready...")
-	if err := framework.WaitForCoreWorkloads(ctx, client, framework.E2ENamespace, 5*time.Minute); err != nil {
+	if err := retrySetup(ctx, "wait for core workloads", 3, func() error {
+		return framework.WaitForCoreWorkloads(ctx, client, framework.E2ENamespace, 5*time.Minute)
+	}); err != nil {
 		fmt.Fprintf(os.Stderr, "[e2e] workloads not ready: %v\n", err)
 		dumpSetupDiagnostics(testCluster.KubeconfigPath)
 		return 1
@@ -132,13 +151,42 @@ func runTests(m *testing.M) int {
 	return m.Run()
 }
 
+func retrySetup(ctx context.Context, label string, attempts int, fn func() error) error {
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if attempt > 1 {
+			fmt.Fprintf(os.Stderr, "[e2e] Retrying %s (attempt %d/%d) after: %v\n", label, attempt, attempts, lastErr)
+		}
+		if err := fn(); err != nil {
+			lastErr = err
+			if attempt == attempts {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("%s: %w", label, ctx.Err())
+			case <-time.After(time.Duration(attempt) * 5 * time.Second):
+			}
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("%s: %w", label, lastErr)
+}
+
 func dumpSetupDiagnostics(kubeconfigPath string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	dumpSetupKubectl(ctx, kubeconfigPath, "nodes", "get", "nodes", "-o", "wide")
+	dumpSetupKubectl(ctx, kubeconfigPath, "describe-nodes", "describe", "nodes")
 	dumpSetupKubectl(ctx, kubeconfigPath, "pods", "get", "pods", "-A", "-o", "wide")
+	dumpSetupKubectl(ctx, kubeconfigPath, "describe-pods", "describe", "pods", "-A")
 	dumpSetupKubectl(ctx, kubeconfigPath, "events", "get", "events", "-A", "--sort-by=.lastTimestamp")
+	dumpSetupHelm(ctx, kubeconfigPath, "helm-list", "list", "-A")
+	for _, release := range []string{"nats", "grafana", "kube-state-metrics"} {
+		dumpSetupHelm(ctx, kubeconfigPath, "helm-status-"+release, "status", release, "--namespace", framework.E2ENamespace)
+	}
 }
 
 func dumpSetupKubectl(ctx context.Context, kubeconfigPath, label string, args ...string) {
@@ -147,7 +195,22 @@ func dumpSetupKubectl(ctx context.Context, kubeconfigPath, label string, args ..
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[e2e] diagnostics kubectl %s failed: %v\n%s\n", label, err, out)
+		writeArtifact("setup-"+label+".txt", out)
 		return
 	}
 	fmt.Fprintf(os.Stderr, "[e2e] diagnostics kubectl %s:\n%s\n", label, out)
+	writeArtifact("setup-"+label+".txt", out)
+}
+
+func dumpSetupHelm(ctx context.Context, kubeconfigPath, label string, args ...string) {
+	allArgs := append([]string{"--kubeconfig", kubeconfigPath}, args...)
+	cmd := exec.CommandContext(ctx, "helm", allArgs...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[e2e] diagnostics helm %s failed: %v\n%s\n", label, err, out)
+		writeArtifact("setup-"+label+".txt", out)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[e2e] diagnostics helm %s:\n%s\n", label, out)
+	writeArtifact("setup-"+label+".txt", out)
 }

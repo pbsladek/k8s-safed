@@ -107,6 +107,20 @@ profiles:
 	}
 }
 
+func TestLoad_PreflightOffMayBeUnquoted(t *testing.T) {
+	path := writeConfig(t, `
+defaults:
+  preflight: off
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Defaults.Preflight != "off" {
+		t.Errorf("defaults.Preflight = %q, want off", cfg.Defaults.Preflight)
+	}
+}
+
 func TestLoad_MissingFile_ReturnsError(t *testing.T) {
 	_, err := Load("/nonexistent/path/safed.yaml")
 	if err == nil {

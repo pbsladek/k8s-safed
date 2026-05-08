@@ -49,7 +49,7 @@ func HelmSetupRepos(ctx context.Context) error {
 	return nil
 }
 
-// HelmInstall installs a release and waits for it to be ready.
+// HelmInstall installs or upgrades a release and waits for it to be ready.
 func HelmInstall(ctx context.Context, kubeconfigPath string, r HelmRelease) error {
 	timeout := r.Timeout
 	if timeout == 0 {
@@ -57,7 +57,7 @@ func HelmInstall(ctx context.Context, kubeconfigPath string, r HelmRelease) erro
 	}
 
 	args := []string{
-		"install", r.ReleaseName, r.Chart,
+		"upgrade", "--install", r.ReleaseName, r.Chart,
 		"--kubeconfig", kubeconfigPath,
 		"--namespace", r.Namespace,
 		"--create-namespace",
@@ -91,7 +91,7 @@ func HelmInstall(ctx context.Context, kubeconfigPath string, r HelmRelease) erro
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("helm install %s (%s): %w", r.ReleaseName, r.Chart, err)
+		return fmt.Errorf("helm upgrade --install %s (%s): %w", r.ReleaseName, r.Chart, err)
 	}
 	return nil
 }

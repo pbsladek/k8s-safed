@@ -100,6 +100,42 @@ func TestDrain_CheckpointResume(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// TestDrain_CorruptCheckpointFailsBeforeCordon
+// --------------------------------------------------------------------------
+
+func TestDrain_CorruptCheckpointFailsBeforeCordon(t *testing.T) {
+	waitAllReady(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	target := firstAgentNode(t, ctx)
+	uncordon(t, target)
+	defer uncordon(t, target)
+
+	cpPath := filepath.Join(t.TempDir(), "corrupt-checkpoint.json")
+	if err := os.WriteFile(cpPath, []byte(`{"nodeName":`), 0600); err != nil {
+		t.Fatalf("write corrupt checkpoint: %v", err)
+	}
+
+	result := testBinary.Drain(ctx, target,
+		"--resume",
+		"--checkpoint-path", cpPath,
+		"--preflight", "off",
+		"--poll-interval", "1s",
+	)
+	if result.Err == nil {
+		t.Fatal("resume with a corrupt checkpoint must fail")
+	}
+	combined := result.Stdout + result.Stderr + result.Err.Error()
+	if !strings.Contains(combined, "loading checkpoint") || !strings.Contains(combined, "parsing checkpoint") {
+		t.Fatalf("corrupt checkpoint failed with unexpected error: %v\nstdout: %s\nstderr: %s",
+			result.Err, result.Stdout, result.Stderr)
+	}
+	verifyNodeNotCordoned(t, target)
+}
+
+// --------------------------------------------------------------------------
 // TestDrain_CheckpointResumeAfterProcessKill
 // --------------------------------------------------------------------------
 
