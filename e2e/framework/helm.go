@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"time"
 )
 
@@ -18,8 +20,8 @@ type HelmRelease struct {
 	Version string
 	// Namespace to install into.
 	Namespace string
-	// ValuesYAML is an optional YAML values override written to a temp file.
-	ValuesYAML string
+	// ValuesFile is an optional Helm values override file.
+	ValuesFile string
 	// Timeout for helm install --wait. Defaults to 5 minutes.
 	Timeout time.Duration
 }
@@ -68,23 +70,8 @@ func HelmInstall(ctx context.Context, kubeconfigPath string, r HelmRelease) erro
 		args = append(args, "--version", r.Version)
 	}
 
-	// Write values to a temp file if provided.
-	if r.ValuesYAML != "" {
-		f, err := os.CreateTemp("", "safed-e2e-values-*.yaml")
-		if err != nil {
-			return fmt.Errorf("create values file: %w", err)
-		}
-		if _, err := f.WriteString(r.ValuesYAML); err != nil {
-			_ = f.Close()
-			_ = os.Remove(f.Name())
-			return fmt.Errorf("write values file: %w", err)
-		}
-		if err := f.Close(); err != nil {
-			_ = os.Remove(f.Name())
-			return fmt.Errorf("close values file: %w", err)
-		}
-		defer func() { _ = os.Remove(f.Name()) }()
-		args = append(args, "-f", f.Name())
+	if r.ValuesFile != "" {
+		args = append(args, "-f", r.ValuesFile)
 	}
 
 	cmd := exec.CommandContext(ctx, "helm", args...)
@@ -94,6 +81,14 @@ func HelmInstall(ctx context.Context, kubeconfigPath string, r HelmRelease) erro
 		return fmt.Errorf("helm upgrade --install %s (%s): %w", r.ReleaseName, r.Chart, err)
 	}
 	return nil
+}
+
+func helmValuesFile(name string) string {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		panic("resolve helm values file: runtime.Caller failed")
+	}
+	return filepath.Join(filepath.Dir(file), "testdata", "helm-values", name)
 }
 
 // HelmUninstall removes a helm release. Missing releases are ignored.
@@ -122,35 +117,7 @@ func NATSRelease(ns string) HelmRelease {
 		Version:     "2.12.6",
 		Namespace:   ns,
 		Timeout:     8 * time.Minute,
-		ValuesYAML: `
-config:
-  cluster:
-    enabled: true
-    replicas: 3
-statefulSet:
-  merge:
-    metadata:
-      annotations:
-        kubectl.safed.io/drain-priority: "10"
-  topologySpreadConstraints:
-    kubernetes.io/hostname:
-      maxSkew: 1
-      whenUnsatisfiable: ScheduleAnyway
-container:
-  image:
-    fullImageName: mirror.gcr.io/library/nats:2.12.6-alpine
-  merge:
-    resources:
-      requests:
-        cpu: 50m
-        memory: 64Mi
-      limits:
-        memory: 128Mi
-reloader:
-  enabled: false
-natsBox:
-  enabled: false
-`,
+		ValuesFile:  helmValuesFile("nats.yaml"),
 	}
 }
 
@@ -163,31 +130,7 @@ func GrafanaRelease(ns string) HelmRelease {
 		Version:     "10.5.15",
 		Namespace:   ns,
 		Timeout:     8 * time.Minute,
-		ValuesYAML: `
-replicas: 3
-annotations:
-  kubectl.safed.io/drain-priority: "100"
-image:
-  registry: mirror.gcr.io
-  repository: grafana/grafana
-topologySpreadConstraints:
-  - maxSkew: 1
-    topologyKey: kubernetes.io/hostname
-    whenUnsatisfiable: ScheduleAnyway
-    labelSelector:
-      matchLabels:
-        app.kubernetes.io/name: grafana
-        app.kubernetes.io/instance: grafana
-resources:
-  requests:
-    cpu: 50m
-    memory: 128Mi
-  limits:
-    memory: 256Mi
-persistence:
-  enabled: false
-adminPassword: safed-e2e
-`,
+		ValuesFile:  helmValuesFile("grafana.yaml"),
 	}
 }
 
@@ -200,13 +143,6 @@ func KubeStateMetricsRelease(ns string) HelmRelease {
 		Version:     "7.3.0",
 		Namespace:   ns,
 		Timeout:     5 * time.Minute,
-		ValuesYAML: `
-resources:
-  requests:
-    cpu: 10m
-    memory: 32Mi
-  limits:
-    memory: 64Mi
-`,
+		ValuesFile:  helmValuesFile("kube-state-metrics.yaml"),
 	}
 }

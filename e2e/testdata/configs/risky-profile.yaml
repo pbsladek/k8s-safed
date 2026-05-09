@@ -1,0 +1,5 @@
+profiles:
+  risky:
+    preflight: strict
+    rollout-timeout: 5m
+    poll-interval: 1s

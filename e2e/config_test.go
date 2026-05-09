@@ -4,11 +4,15 @@ package e2e
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/yaml"
 
 	"github.com/pbsladek/k8s-safed/e2e/framework"
 )
@@ -16,6 +20,42 @@ import (
 // --------------------------------------------------------------------------
 // TestDrain_ProfileConfigAndCLIOverride
 // --------------------------------------------------------------------------
+
+func TestConfigFixturesAreValidYAML(t *testing.T) {
+	fixtures := []string{
+		"risky-profile.yaml",
+		"defaults-mode-profile.yaml",
+		"env-strict.yaml",
+		"explicit-dry-run.yaml",
+		"unknown-field.yaml",
+		"invalid-profile.yaml",
+	}
+
+	for _, fixture := range fixtures {
+		t.Run(fixture, func(t *testing.T) {
+			f, err := os.Open(configFixturePath(t, fixture))
+			if err != nil {
+				t.Fatalf("open fixture: %v", err)
+			}
+			defer func() { _ = f.Close() }()
+
+			decoder := yaml.NewYAMLOrJSONDecoder(f, 4096)
+			var doc map[string]any
+			if err := decoder.Decode(&doc); err != nil {
+				t.Fatalf("decode fixture: %v", err)
+			}
+			if len(doc) == 0 {
+				t.Fatal("fixture decoded to an empty document")
+			}
+
+			var extra map[string]any
+			err = decoder.Decode(&extra)
+			if err != nil && err != io.EOF {
+				t.Fatalf("decode extra document: %v", err)
+			}
+		})
+	}
+}
 
 func TestDrain_ProfileConfigAndCLIOverride(t *testing.T) {
 	waitAllReady(t)
@@ -30,16 +70,7 @@ func TestDrain_ProfileConfigAndCLIOverride(t *testing.T) {
 	}()
 	deployDeploymentsOnNode(t, ctx, target, framework.WorkerManifest, "worker")
 
-	configPath := filepath.Join(t.TempDir(), "safed.yaml")
-	configData := []byte(`profiles:
-  risky:
-    preflight: strict
-    rollout-timeout: 5m
-    poll-interval: 1s
-`)
-	if err := os.WriteFile(configPath, configData, 0600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+	configPath := configFixturePath(t, "risky-profile.yaml")
 
 	strict := testBinary.Drain(ctx, target,
 		"--config", configPath,
@@ -87,18 +118,7 @@ func TestDrain_ConfigDefaultsModeProfilePrecedence(t *testing.T) {
 	}()
 	deployDeploymentsOnNode(t, ctx, target, framework.WorkerManifest, "worker")
 
-	configPath := filepath.Join(t.TempDir(), "safed.yaml")
-	configData := []byte(`defaults:
-  preflight: strict
-  poll-interval: 1s
-profiles:
-  lenient:
-    preflight: warn
-    rollout-timeout: 5m
-`)
-	if err := os.WriteFile(configPath, configData, 0600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+	configPath := configFixturePath(t, "defaults-mode-profile.yaml")
 
 	defaults := testBinary.Drain(ctx, target, "--config", configPath)
 	if defaults.Err == nil {
@@ -155,15 +175,7 @@ func TestDrain_ConfigEnvAndExplicitConfigPrecedence(t *testing.T) {
 	}()
 	deployDeploymentsOnNode(t, ctx, target, framework.WorkerManifest, "worker")
 
-	dir := t.TempDir()
-	envConfigPath := filepath.Join(dir, "env-safed.yaml")
-	envConfigData := []byte(`defaults:
-  preflight: strict
-  poll-interval: 1s
-`)
-	if err := os.WriteFile(envConfigPath, envConfigData, 0600); err != nil {
-		t.Fatalf("write env config: %v", err)
-	}
+	envConfigPath := configFixturePath(t, "env-strict.yaml")
 	t.Setenv("KUBECTL_SAFED_CONFIG", envConfigPath)
 
 	fromEnv := testBinary.Drain(ctx, target,
@@ -175,15 +187,7 @@ func TestDrain_ConfigEnvAndExplicitConfigPrecedence(t *testing.T) {
 	}
 	verifyNodeNotCordoned(t, target)
 
-	explicitConfigPath := filepath.Join(dir, "explicit-safed.yaml")
-	explicitConfigData := []byte(`defaults:
-  preflight: off
-  dry-run: true
-  poll-interval: 1s
-`)
-	if err := os.WriteFile(explicitConfigPath, explicitConfigData, 0600); err != nil {
-		t.Fatalf("write explicit config: %v", err)
-	}
+	explicitConfigPath := configFixturePath(t, "explicit-dry-run.yaml")
 
 	explicit := testBinary.Drain(ctx, target,
 		"--config", explicitConfigPath,
@@ -213,12 +217,7 @@ func TestDrain_ConfigValidationAndModeErrors(t *testing.T) {
 	uncordon(t, target)
 	defer uncordon(t, target)
 
-	badConfigPath := filepath.Join(t.TempDir(), "bad-config.yaml")
-	if err := os.WriteFile(badConfigPath, []byte(`defaults:
-  typo-field: true
-`), 0600); err != nil {
-		t.Fatalf("write bad config: %v", err)
-	}
+	badConfigPath := configFixturePath(t, "unknown-field.yaml")
 
 	tests := []struct {
 		name  string
@@ -329,15 +328,7 @@ func TestDrain_InvalidOptions(t *testing.T) {
 	uncordon(t, target)
 	defer uncordon(t, target)
 
-	configPath := filepath.Join(t.TempDir(), "invalid-profile.yaml")
-	configData := []byte(`profiles:
-  invalid:
-    preflight: maybe
-    rollout-timeout: 5m
-`)
-	if err := os.WriteFile(configPath, configData, 0600); err != nil {
-		t.Fatalf("write invalid profile config: %v", err)
-	}
+	configPath := configFixturePath(t, "invalid-profile.yaml")
 
 	tests := []struct {
 		name  string
@@ -428,4 +419,13 @@ func TestDrain_InvalidOptions(t *testing.T) {
 		"--checkpoint-path can only be used when draining a single node",
 		"--checkpoint-path", filepath.Join(t.TempDir(), "shared-checkpoint.json"),
 	)
+}
+
+func configFixturePath(t *testing.T, name string) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Join(filepath.Dir(file), "testdata", "configs", name)
 }

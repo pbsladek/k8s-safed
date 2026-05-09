@@ -1,0 +1,7 @@
+defaults:
+  preflight: strict
+  poll-interval: 1s
+profiles:
+  lenient:
+    preflight: warn
+    rollout-timeout: 5m
