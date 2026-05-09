@@ -195,11 +195,11 @@ func dumpSetupKubectl(ctx context.Context, kubeconfigPath, label string, args ..
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[e2e] diagnostics kubectl %s failed: %v\n%s\n", label, err, out)
-		writeArtifact("setup-"+label+".txt", out)
+		writeSuiteArtifact("setup", label+".txt", out)
 		return
 	}
 	fmt.Fprintf(os.Stderr, "[e2e] diagnostics kubectl %s:\n%s\n", label, out)
-	writeArtifact("setup-"+label+".txt", out)
+	writeSuiteArtifact("setup", label+".txt", out)
 }
 
 func dumpSetupHelm(ctx context.Context, kubeconfigPath, label string, args ...string) {
@@ -208,9 +208,9 @@ func dumpSetupHelm(ctx context.Context, kubeconfigPath, label string, args ...st
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[e2e] diagnostics helm %s failed: %v\n%s\n", label, err, out)
-		writeArtifact("setup-"+label+".txt", out)
+		writeSuiteArtifact("setup", label+".txt", out)
 		return
 	}
 	fmt.Fprintf(os.Stderr, "[e2e] diagnostics helm %s:\n%s\n", label, out)
-	writeArtifact("setup-"+label+".txt", out)
+	writeSuiteArtifact("setup", label+".txt", out)
 }

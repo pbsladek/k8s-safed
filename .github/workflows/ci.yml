@@ -65,6 +65,9 @@ jobs:
       - name: Run tests
         run: go test -v -race -count=1 ./...
 
+      - name: Validate docs examples
+        run: go test -v ./docs/examples
+
   lint:
     name: lint
     runs-on: ubuntu-latest

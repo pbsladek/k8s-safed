@@ -89,8 +89,8 @@ kubectl safed drain worker-3 \
   --rollout-timeout=10m
 ```
 
-The skipped workload is not patched for rolling restart. Any pods still left on
-the node are still considered during the remaining-pod phase.
+The skipped workload is not patched for rolling restart, and its managed pods
+are left untouched during the remaining-pod phase.
 
 ## 6. Resume After Laptop Disconnect Or Ctrl-C
 

@@ -57,18 +57,21 @@ type Printer struct {
 	out    io.Writer
 	mu     sync.Mutex
 	format LogFormat
+	now    func() time.Time
 }
 
 // NewPrinter returns a Printer that writes to stdout in plain format.
-func NewPrinter() *Printer { return &Printer{out: os.Stdout, format: LogFormatPlain} }
+func NewPrinter() *Printer { return &Printer{out: os.Stdout, format: LogFormatPlain, now: time.Now} }
 
 // NewPrinterTo returns a Printer that writes to w in plain format.
 // Primarily used in tests to capture or discard output.
-func NewPrinterTo(w io.Writer) *Printer { return &Printer{out: w, format: LogFormatPlain} }
+func NewPrinterTo(w io.Writer) *Printer {
+	return &Printer{out: w, format: LogFormatPlain, now: time.Now}
+}
 
 // NewPrinterWithFormat returns a Printer that writes to w using the given LogFormat.
 func NewPrinterWithFormat(w io.Writer, f LogFormat) *Printer {
-	return &Printer{out: w, format: f}
+	return &Printer{out: w, format: f, now: time.Now}
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +143,11 @@ func (p *Printer) emit(level, subject, msg string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	now := time.Now()
+	nowFn := p.now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	now := nowFn()
 	switch p.format {
 	case LogFormatJSON:
 		rec := map[string]any{

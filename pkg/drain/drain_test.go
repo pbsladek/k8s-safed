@@ -1094,6 +1094,9 @@ func TestFilterWorkloads_SkipWorkload_Removes(t *testing.T) {
 	if got[0].Name != "db" {
 		t.Errorf("expected remaining workload to be 'db', got %q", got[0].Name)
 	}
+	if len(d.protectedWorkloads) != 1 || d.protectedWorkloads[0].Name != "api" {
+		t.Fatalf("protected workloads = %#v, want api", d.protectedWorkloads)
+	}
 }
 
 func TestFilterWorkloads_OnlyWorkload_KeepsOnlyNamed(t *testing.T) {
@@ -1114,6 +1117,9 @@ func TestFilterWorkloads_OnlyWorkload_KeepsOnlyNamed(t *testing.T) {
 	if got[0].Name != "db" {
 		t.Errorf("expected 'db', got %q", got[0].Name)
 	}
+	if len(d.protectedWorkloads) != 2 {
+		t.Fatalf("protected workloads = %#v, want api and worker", d.protectedWorkloads)
+	}
 }
 
 func TestFilterWorkloads_SkipAll_ReturnsEmpty(t *testing.T) {
@@ -1132,6 +1138,9 @@ func TestFilterWorkloads_SkipAll_ReturnsEmpty(t *testing.T) {
 	got := d.filterWorkloads(wls)
 	if len(got) != 0 {
 		t.Errorf("expected 0 workloads after skipping all, got %d", len(got))
+	}
+	if len(d.protectedWorkloads) != 2 {
+		t.Fatalf("protected workloads = %#v, want both workloads", d.protectedWorkloads)
 	}
 }
 

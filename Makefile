@@ -10,7 +10,7 @@ LDFLAGS    := -s -w
 # Respect GOBIN / PATH install location; default to /usr/local/bin.
 INSTALL_DIR ?= /usr/local/bin
 
-.PHONY: all build test vet lint fmt check install clean release snapshot help e2e e2e-full e2e-core e2e-smoke e2e-preflight e2e-config e2e-rbac e2e-failures e2e-eviction e2e-checkpoint e2e-observability e2e-nodes e2e-focused e2e-run
+.PHONY: all build test test-coverage vet lint fmt check docs-examples-check install clean release snapshot help e2e e2e-full e2e-pr e2e-core e2e-smoke e2e-precheck e2e-preflight e2e-config e2e-rbac e2e-failures e2e-eviction e2e-checkpoint e2e-observability e2e-nodes e2e-focused e2e-run
 
 all: check build ## Run checks then build (default)
 
@@ -30,6 +30,10 @@ test: ## Run all tests with race detector
 test-v: ## Run all tests verbose
 	$(GO) test -race -v ./...
 
+test-coverage: ## Run unit tests with coverage report at coverage.out
+	$(GO) test -race -covermode=atomic -coverprofile=coverage.out ./...
+	$(GO) tool cover -func=coverage.out
+
 vet: ## Run go vet
 	$(GO) vet ./...
 
@@ -39,7 +43,10 @@ fmt: ## Format all Go source files
 lint: ## Run golangci-lint (requires golangci-lint to be installed)
 	$(GO_ENV) golangci-lint run ./...
 
-check: fmt vet test lint ## Format, vet, test, and lint
+docs-examples-check: ## Validate docs/examples snippets and reusable example files
+	$(GO) test ./docs/examples
+
+check: fmt vet test docs-examples-check lint ## Format, vet, test, docs example checks, and lint
 
 ## ── E2E tests ─────────────────────────────────────────────────────────────────
 
@@ -54,11 +61,17 @@ e2e: ## Run e2e tests against a real k3d cluster (requires k3d in PATH)
 e2e-full: ## Run the complete e2e suite
 	$(E2E_ENV) $(GO) test $(E2E_FLAGS) $(E2E_PKG)
 
+e2e-pr: ## Run short PR-oriented e2e coverage
+	$(E2E_ENV) $(GO) test $(E2E_FLAGS) -run 'TestDrain_(DryRun|ConfigValidationAndModeErrors|RBACMissingNodePatchFailsBeforeMutation|PDBAllowedEviction|EmitEventsFailure)$$' $(E2E_PKG)
+
 e2e-core: ## Run core e2e coverage suitable for PR validation
 	$(E2E_ENV) $(GO) test $(E2E_FLAGS) -run 'TestDrain_(DryRun|NATS|Grafana|MultipleWorkloads|Preflight_StrictMode|ConfigDefaultsModeProfilePrecedence|CheckpointResume|CorruptCheckpointFailsBeforeCordon|RBACMissingNodePatchFailsBeforeMutation|PDBAllowedEviction)$$' $(E2E_PKG)
 
 e2e-smoke: ## Run a minimal e2e smoke suite
 	$(E2E_ENV) $(GO) test $(E2E_FLAGS) -run 'TestDrain_(DryRun|Preflight_StrictMode|RBACMissingNodePatchFailsBeforeMutation)$$' $(E2E_PKG)
+
+e2e-precheck: ## Validate local tools before creating a k3d e2e cluster
+	hack/e2e-preflight.sh
 
 e2e-preflight: ## Run preflight-focused e2e tests
 	$(E2E_ENV) $(GO) test $(E2E_FLAGS) -run 'TestDrain_Preflight_' $(E2E_PKG)

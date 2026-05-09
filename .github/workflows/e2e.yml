@@ -77,7 +77,7 @@ jobs:
       - name: Run E2E tests
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            make e2e-core E2E_TIMEOUT=30m
+            make e2e-pr E2E_TIMEOUT=25m
           else
             make e2e-full E2E_TIMEOUT=35m
           fi

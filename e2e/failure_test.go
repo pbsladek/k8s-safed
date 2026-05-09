@@ -86,10 +86,7 @@ func TestDrain_ImagePullAbort(t *testing.T) {
 		"--rollout-timeout", "2m",
 		"--poll-interval", "1s",
 	)
-	if result.Err == nil {
-		t.Fatal("drain should fail fast when a rollout pod cannot pull its image")
-	}
-	verifyNodeCordoned(t, target)
+	expectFailedDrainLeavesNodeCordoned(t, result, target)
 	combined := result.Stdout + result.Stderr + result.Err.Error()
 	if !strings.Contains(combined, "ImagePullBackOff") && !strings.Contains(combined, "ErrImagePull") {
 		t.Fatalf("image pull failure output missing expected reason\nerr: %v\nstdout: %s\nstderr: %s",
@@ -130,12 +127,7 @@ func TestDrain_UncordonOnFailure(t *testing.T) {
 	defer uncordon(t, target)
 
 	result := testBinary.Drain(ctx, target, "--rollout-timeout", "3m", "--uncordon-on-failure")
-	if result.Err == nil {
-		t.Fatal("drain should fail on CrashLoopBackOff")
-	}
-
-	// --uncordon-on-failure must restore the node to schedulable.
-	verifyNodeNotCordoned(t, target)
+	expectFailedDrainUncordonsNode(t, result, target)
 }
 
 // --------------------------------------------------------------------------
@@ -174,10 +166,7 @@ func TestDrain_AlreadyCordonedFailureDoesNotUncordon(t *testing.T) {
 		"--rollout-timeout", "3m",
 		"--uncordon-on-failure",
 	)
-	if result.Err == nil {
-		t.Fatal("drain should fail on CrashLoopBackOff")
-	}
-	verifyNodeCordoned(t, target)
+	expectFailedDrainLeavesNodeCordoned(t, result, target)
 
 	if !strings.Contains(result.Stdout+result.Stderr, "--uncordon-on-failure has no effect") {
 		t.Fatalf("output missing already-cordoned uncordon warning\nstdout: %s\nstderr: %s",

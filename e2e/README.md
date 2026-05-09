@@ -4,6 +4,8 @@ The e2e suite runs only with the `e2e` build tag:
 
 ```bash
 make e2e
+make e2e-precheck
+make e2e-pr
 make e2e-core
 make e2e-rbac
 make e2e-run TEST=TestDrain_NATS
@@ -31,8 +33,10 @@ so editor tooling can load helper files such as `framework/helm.go`.
 | Target | Scope |
 |---|---|
 | `make e2e-full` | Full real-cluster suite. This is also what `make e2e` runs. |
+| `make e2e-pr` | Short PR-oriented real-cluster suite covering representative config, RBAC, eviction, dry-run, and event failure paths. |
 | `make e2e-core` | Main happy-path, preflight, config, failure, checkpoint, and RBAC coverage. |
 | `make e2e-smoke` | Fastest confidence check for representative NATS/Grafana behavior. |
+| `make e2e-precheck` | Local toolchain readiness check before creating a k3d cluster. |
 | `make e2e-preflight` | Preflight detection, validation, and dry-run edge cases. |
 | `make e2e-config` | Config defaults, modes, profiles, env vars, and CLI precedence. |
 | `make e2e-rbac` | Restricted-ServiceAccount permission failures and best-effort event emission. |

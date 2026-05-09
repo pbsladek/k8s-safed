@@ -83,14 +83,13 @@ func dumpKubectl(t *testing.T, ctx context.Context, label string, args ...string
 	allArgs := append([]string{"--kubeconfig", testCluster.KubeconfigPath}, args...)
 	cmd := exec.CommandContext(ctx, "kubectl", allArgs...)
 	out, err := cmd.CombinedOutput()
-	artifactName := safeArtifactName(t.Name() + "-" + label + ".txt")
 	if err != nil {
 		t.Logf("[diagnostics] kubectl %s failed: %v\n%s", label, err, out)
-		writeArtifact(artifactName, out)
+		writeTestArtifact(t, label+".txt", out)
 		return
 	}
 	t.Logf("[diagnostics] kubectl %s:\n%s", label, out)
-	writeArtifact(artifactName, out)
+	writeTestArtifact(t, label+".txt", out)
 }
 
 func dumpHelm(t *testing.T, ctx context.Context, label string, args ...string) {
@@ -98,14 +97,13 @@ func dumpHelm(t *testing.T, ctx context.Context, label string, args ...string) {
 	allArgs := append([]string{"--kubeconfig", testCluster.KubeconfigPath}, args...)
 	cmd := exec.CommandContext(ctx, "helm", allArgs...)
 	out, err := cmd.CombinedOutput()
-	artifactName := safeArtifactName(t.Name() + "-" + label + ".txt")
 	if err != nil {
 		t.Logf("[diagnostics] helm %s failed: %v\n%s", label, err, out)
-		writeArtifact(artifactName, out)
+		writeTestArtifact(t, label+".txt", out)
 		return
 	}
 	t.Logf("[diagnostics] helm %s:\n%s", label, out)
-	writeArtifact(artifactName, out)
+	writeTestArtifact(t, label+".txt", out)
 }
 
 func cleanupManifest(t *testing.T, manifest string) {
@@ -124,15 +122,25 @@ func safeArtifactName(name string) string {
 	return artifactNamePattern.ReplaceAllString(name, "_")
 }
 
-func writeArtifact(name string, data []byte) {
+func writeTestArtifact(t *testing.T, name string, data []byte) {
+	t.Helper()
+	writeArtifactInDir(safeArtifactName(t.Name()), name, data)
+}
+
+func writeSuiteArtifact(group, name string, data []byte) {
+	writeArtifactInDir(safeArtifactName(group), name, data)
+}
+
+func writeArtifactInDir(group, name string, data []byte) {
 	if artifactDir == "" || len(data) == 0 {
 		return
 	}
-	if err := os.MkdirAll(artifactDir, 0755); err != nil {
+	dir := filepath.Join(artifactDir, group)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "[e2e] write artifact mkdir: %v\n", err)
 		return
 	}
-	path := filepath.Join(artifactDir, safeArtifactName(name))
+	path := filepath.Join(dir, safeArtifactName(name))
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "[e2e] write artifact %s: %v\n", path, err)
 	}
@@ -253,6 +261,22 @@ func verifyNodeNotCordoned(t *testing.T, nodeName string) {
 	if node.Spec.Unschedulable {
 		t.Errorf("node %s should NOT be cordoned", nodeName)
 	}
+}
+
+func expectFailedDrainLeavesNodeCordoned(t *testing.T, result framework.DrainResult, target string) {
+	t.Helper()
+	if result.Err == nil {
+		t.Fatalf("drain should fail\nstdout: %s\nstderr: %s", result.Stdout, result.Stderr)
+	}
+	verifyNodeCordoned(t, target)
+}
+
+func expectFailedDrainUncordonsNode(t *testing.T, result framework.DrainResult, target string) {
+	t.Helper()
+	if result.Err == nil {
+		t.Fatalf("drain should fail\nstdout: %s\nstderr: %s", result.Stdout, result.Stderr)
+	}
+	verifyNodeNotCordoned(t, target)
 }
 
 func firstAgentNode(t *testing.T, ctx context.Context) string {

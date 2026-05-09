@@ -8,6 +8,7 @@ mise install
 mise exec -- go version
 make test
 make lint
+make docs-examples-check
 ```
 
 The pinned Go toolchain is declared in the repo root `.mise.toml`. Make targets
@@ -20,6 +21,8 @@ commands through the helper:
 ```bash
 hack/dev-go.sh go test ./...
 hack/dev-go.sh golangci-lint run ./...
+hack/dev-go.sh make test-coverage
+hack/dev-go.sh make e2e-precheck
 hack/dev-go.sh make e2e-smoke
 ```
 
@@ -29,3 +32,12 @@ The helper exports:
 - `PATH` with the mise Go `bin` directory first
 - `SAFED_E2E_GO` so the e2e harness builds `kubectl-safed` with the same Go
   binary used by the test command
+
+Useful maintenance targets:
+
+```bash
+make test-coverage       # writes coverage.out and prints package coverage
+make docs-examples-check # validates docs/examples reusable YAML and snippets
+make e2e-precheck        # verifies mise, Docker, k3d, kubectl, and Helm
+make e2e-pr              # short real-cluster suite used for pull requests
+```
