@@ -117,6 +117,48 @@ func TestDrain_Preflight_RecreateStrictMode(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// TestDrain_Preflight_PausedDeploymentStrictMode
+// --------------------------------------------------------------------------
+
+func TestDrain_Preflight_PausedDeploymentStrictMode(t *testing.T) {
+	waitAllReady(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancel()
+
+	target := firstAgentNode(t, ctx)
+	defer uncordon(t, target)
+
+	manifest := framework.DeploymentManifest(framework.DeploymentManifestOptions{
+		Name:     "paused-risk",
+		Replicas: 2,
+		Priority: 100,
+	})
+	defer func() {
+		cleanupManifest(t, manifest)
+	}()
+	deployDeploymentsOnNode(t, ctx, target, manifest, "paused-risk")
+	patchDeployment(t, ctx, framework.E2ENamespace, "paused-risk", mustJSONPatch(t, map[string]any{
+		"spec": map[string]any{"paused": true},
+	}))
+
+	result := testBinary.Drain(ctx, target,
+		"--preflight", "strict",
+		"--only-workload", "Deployment/e2e/paused-risk",
+		"--poll-interval", "1s",
+	)
+	if result.Err == nil {
+		t.Fatal("strict preflight must abort on paused Deployment")
+	}
+	verifyNodeNotCordoned(t, target)
+	combined := result.Stdout + result.Stderr + result.Err.Error()
+	if !strings.Contains(combined, "paused Deployment") {
+		t.Fatalf("strict preflight output missing paused Deployment risk\nerr: %v\nstdout: %s\nstderr: %s",
+			result.Err, result.Stdout, result.Stderr)
+	}
+}
+
+// --------------------------------------------------------------------------
 // TestDrain_Preflight_StatefulSetSingleReplicaStrictMode
 // --------------------------------------------------------------------------
 
@@ -158,6 +200,93 @@ func TestDrain_Preflight_StatefulSetSingleReplicaStrictMode(t *testing.T) {
 	combined := result.Stdout + result.Stderr + result.Err.Error()
 	if !strings.Contains(combined, "single replica StatefulSet") {
 		t.Fatalf("strict preflight output missing StatefulSet risk\nerr: %v\nstdout: %s\nstderr: %s",
+			result.Err, result.Stdout, result.Stderr)
+	}
+}
+
+func TestDrain_Preflight_StatefulSetOnDeleteStrictMode(t *testing.T) {
+	waitAllReady(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancel()
+
+	target := firstAgentNode(t, ctx)
+	defer uncordon(t, target)
+
+	manifest := framework.StatefulSetManifest(framework.StatefulSetManifestOptions{
+		Name:     "ondelete-sts",
+		Priority: 100,
+		Replicas: 2,
+		OnDelete: true,
+	})
+	defer func() {
+		cleanupManifest(t, manifest)
+	}()
+	withOnlyNodeSchedulable(t, ctx, target, func() {
+		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, manifest); err != nil {
+			t.Fatalf("apply OnDelete StatefulSet: %v", err)
+		}
+		if err := framework.WaitForStatefulSetReady(ctx, testClient, framework.E2ENamespace, "ondelete-sts", workloadReady); err != nil {
+			t.Fatalf("OnDelete StatefulSet not ready on target node: %v", err)
+		}
+	})
+
+	result := testBinary.Drain(ctx, target,
+		"--preflight", "strict",
+		"--only-workload", "StatefulSet/e2e/ondelete-sts",
+		"--poll-interval", "1s",
+	)
+	if result.Err == nil {
+		t.Fatal("strict preflight must abort on OnDelete StatefulSet")
+	}
+	verifyNodeNotCordoned(t, target)
+	combined := result.Stdout + result.Stderr + result.Err.Error()
+	if !strings.Contains(combined, "OnDelete update strategy") {
+		t.Fatalf("strict preflight output missing OnDelete risk\nerr: %v\nstdout: %s\nstderr: %s",
+			result.Err, result.Stdout, result.Stderr)
+	}
+}
+
+func TestDrain_Preflight_StatefulSetPartitionStrictMode(t *testing.T) {
+	waitAllReady(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancel()
+
+	target := firstAgentNode(t, ctx)
+	defer uncordon(t, target)
+
+	partition := int32(1)
+	manifest := framework.StatefulSetManifest(framework.StatefulSetManifestOptions{
+		Name:      "partition-sts",
+		Priority:  100,
+		Replicas:  2,
+		Partition: &partition,
+	})
+	defer func() {
+		cleanupManifest(t, manifest)
+	}()
+	withOnlyNodeSchedulable(t, ctx, target, func() {
+		if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, manifest); err != nil {
+			t.Fatalf("apply partitioned StatefulSet: %v", err)
+		}
+		if err := framework.WaitForStatefulSetReady(ctx, testClient, framework.E2ENamespace, "partition-sts", workloadReady); err != nil {
+			t.Fatalf("partitioned StatefulSet not ready on target node: %v", err)
+		}
+	})
+
+	result := testBinary.Drain(ctx, target,
+		"--preflight", "strict",
+		"--only-workload", "StatefulSet/e2e/partition-sts",
+		"--poll-interval", "1s",
+	)
+	if result.Err == nil {
+		t.Fatal("strict preflight must abort on partitioned StatefulSet")
+	}
+	verifyNodeNotCordoned(t, target)
+	combined := result.Stdout + result.Stderr + result.Err.Error()
+	if !strings.Contains(combined, "partitioned StatefulSet rollout") {
+		t.Fatalf("strict preflight output missing partition risk\nerr: %v\nstdout: %s\nstderr: %s",
 			result.Err, result.Stdout, result.Stderr)
 	}
 }

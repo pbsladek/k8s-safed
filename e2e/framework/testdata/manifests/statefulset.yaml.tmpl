@@ -20,6 +20,15 @@ metadata:
 spec:
   serviceName: {{ .Name }}
   replicas: {{ .Replicas }}
+{{ if .OnDelete }}
+  updateStrategy:
+    type: OnDelete
+{{ else if .Partition }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: {{ .Partition }}
+{{ end }}
   selector:
     matchLabels:
       app: {{ .Name }}

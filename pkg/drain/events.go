@@ -22,12 +22,17 @@ type EventEmitter struct {
 	client  kubernetes.Interface
 	out     *Printer
 	enabled bool
+	clock   clock
 }
 
 // NewEventEmitter creates an EventEmitter. When enabled is false all methods
 // are no-ops and no API calls are made.
 func NewEventEmitter(client kubernetes.Interface, out *Printer, enabled bool) *EventEmitter {
-	return &EventEmitter{client: client, out: out, enabled: enabled}
+	return NewEventEmitterWithClock(client, out, enabled, realClock{})
+}
+
+func NewEventEmitterWithClock(client kubernetes.Interface, out *Printer, enabled bool, clk clock) *EventEmitter {
+	return &EventEmitter{client: client, out: out, enabled: enabled, clock: defaultClock(clk)}
 }
 
 // NodeEvent emits an Event to the node object. evType is corev1.EventTypeNormal
@@ -50,9 +55,10 @@ func (e *EventEmitter) WorkloadEvent(ctx context.Context, w workload.Workload, r
 }
 
 func (e *EventEmitter) build(kind, name, namespace, reason, msg, evType string) *corev1.Event {
-	now := metav1.Now()
+	nowTime := e.clock.Now()
+	now := metav1.NewTime(nowTime)
 	// Event name must be unique; combine resource name with nanosecond timestamp.
-	evName := fmt.Sprintf("%s.%016x", name, time.Now().UnixNano())
+	evName := fmt.Sprintf("%s.%016x", name, nowTime.UnixNano())
 	return &corev1.Event{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      evName,

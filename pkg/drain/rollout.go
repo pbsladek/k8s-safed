@@ -76,7 +76,7 @@ func (d *Drainer) rollingRestart(ctx context.Context, w workload.Workload) error
 // generation from the PATCH response so the rollout wait can anchor on the
 // exact revision this drain triggered, not a stale pre-patch snapshot.
 func (d *Drainer) restartDeployment(ctx context.Context, namespace, name string) (int64, error) {
-	patch, err := buildRestartPatch()
+	patch, err := buildRestartPatch(d.now())
 	if err != nil {
 		return 0, err
 	}
@@ -93,7 +93,7 @@ func (d *Drainer) restartDeployment(ctx context.Context, namespace, name string)
 // restartStatefulSet patches the StatefulSet pod template with a restartedAt
 // annotation. Returns the StatefulSet's generation from the PATCH response.
 func (d *Drainer) restartStatefulSet(ctx context.Context, namespace, name string) (int64, error) {
-	patch, err := buildRestartPatch()
+	patch, err := buildRestartPatch(d.now())
 	if err != nil {
 		return 0, err
 	}
@@ -109,8 +109,8 @@ func (d *Drainer) restartStatefulSet(ctx context.Context, namespace, name string
 
 // buildRestartPatch constructs the strategic-merge patch that sets the
 // kubectl.kubernetes.io/restartedAt annotation on the pod template.
-func buildRestartPatch() ([]byte, error) {
-	ts := time.Now().UTC().Format(time.RFC3339)
+func buildRestartPatch(now time.Time) ([]byte, error) {
+	ts := now.UTC().Format(time.RFC3339)
 	patch := map[string]any{
 		"spec": map[string]any{
 			"template": map[string]any{
@@ -530,10 +530,11 @@ func isTransientAPIError(err error) bool {
 	return k8s.IsTransientAPIError(err)
 }
 
-// retryTransient calls fn up to 3 times, retrying after interval when the
+// retryTransient calls fn up to 3 times, retrying after the drainer poll
+// interval when the
 // returned error is a transient Kubernetes API error. The first non-transient
 // error is returned immediately. Context cancellation stops the retry loop.
-func retryTransient(ctx context.Context, interval time.Duration, fn func() error) error {
+func (d *Drainer) retryTransient(ctx context.Context, fn func() error) error {
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -544,7 +545,7 @@ func retryTransient(ctx context.Context, interval time.Duration, fn func() error
 		select {
 		case <-ctx.Done():
 			return lastErr
-		case <-time.After(interval):
+		case <-d.after(d.pollInterval()):
 		}
 	}
 	return lastErr

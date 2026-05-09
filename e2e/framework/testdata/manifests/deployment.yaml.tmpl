@@ -9,6 +9,9 @@ metadata:
 {{ end }}
 spec:
   replicas: {{ .Replicas }}
+{{ if .Paused }}
+  paused: true
+{{ end }}
 {{ if gt .MinReadySeconds 0 }}
   minReadySeconds: {{ .MinReadySeconds }}
 {{ end }}

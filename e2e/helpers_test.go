@@ -438,45 +438,96 @@ func setDeploymentMinReadySeconds(t *testing.T, ctx context.Context, namespace, 
 
 func waitForCheckpointEntry(t *testing.T, path, key string, timeout time.Duration) *drainpkg.Checkpoint {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
 	var lastErr error
-	for time.Now().Before(deadline) {
+	var found *drainpkg.Checkpoint
+	waitUntil(t, timeout, 200*time.Millisecond, func() (bool, string) {
 		cp, err := drainpkg.LoadCheckpoint(path)
 		if err != nil {
 			lastErr = err
 		} else if cp.Completed[key] {
-			return cp
+			found = cp
+			return true, "checkpoint entry found"
 		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	t.Fatalf("checkpoint %s did not contain %s within %s (lastErr=%v)", path, key, timeout, lastErr)
-	return nil
+		return false, fmt.Sprintf("lastErr=%v", lastErr)
+	})
+	return found
 }
 
 func waitForPodWithSelectorOnNode(t *testing.T, ctx context.Context, nodeName, namespace, labelSelector string, timeout time.Duration) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
+	waitUntil(t, timeout, 2*time.Second, func() (bool, string) {
 		pods, err := testClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 			FieldSelector: "spec.nodeName=" + nodeName,
 			LabelSelector: labelSelector,
 		})
 		if err != nil {
-			t.Fatalf("list pods with %q on %s: %v", labelSelector, nodeName, err)
+			return false, fmt.Sprintf("list error: %v", err)
 		}
+		phases := make([]string, 0, len(pods.Items))
 		for _, pod := range pods.Items {
 			if pod.Status.Phase == "Running" {
-				return
+				return true, fmt.Sprintf("running pod %s/%s", pod.Namespace, pod.Name)
 			}
+			phases = append(phases, fmt.Sprintf("%s/%s=%s", pod.Namespace, pod.Name, pod.Status.Phase))
+		}
+		if err := ctx.Err(); err != nil {
+			return false, fmt.Sprintf("context error: %v", err)
+		}
+		return false, fmt.Sprintf("observed pods: %s", strings.Join(phases, ", "))
+	})
+}
+
+func runningPodWithSelectorOnNode(t *testing.T, ctx context.Context, nodeName, namespace, labelSelector string) (string, types.UID) {
+	t.Helper()
+	pods, err := testClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + nodeName,
+		LabelSelector: labelSelector,
+	})
+	if err != nil {
+		t.Fatalf("list pods with %q on %s: %v", labelSelector, nodeName, err)
+	}
+	for _, pod := range pods.Items {
+		if pod.Status.Phase == "Running" {
+			return pod.Name, pod.UID
+		}
+	}
+	t.Fatalf("no running pod with %q on %s", labelSelector, nodeName)
+	return "", ""
+}
+
+func waitForPodUIDGone(t *testing.T, ctx context.Context, namespace, name string, uid types.UID, timeout time.Duration) {
+	t.Helper()
+	waitUntil(t, timeout, 2*time.Second, func() (bool, string) {
+		pod, err := testClient.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return true, fmt.Sprintf("pod %s/%s no longer exists", namespace, name)
+		}
+		if pod.UID != uid {
+			return true, fmt.Sprintf("pod %s/%s recreated with uid %s", namespace, name, pod.UID)
+		}
+		if err := ctx.Err(); err != nil {
+			return false, fmt.Sprintf("context error: %v", err)
+		}
+		return false, fmt.Sprintf("pod %s/%s still has uid %s", namespace, name, uid)
+	})
+}
+
+func waitUntil(t *testing.T, timeout, interval time.Duration, observe func() (bool, string)) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	last := ""
+	for {
+		ok, observation := observe()
+		if observation != "" {
+			last = observation
+		}
+		if ok {
+			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("no running pod with %q on %s within %s", labelSelector, nodeName, timeout)
+			t.Fatalf("condition not met within %s (last observation: %s)", timeout, last)
 		}
-		select {
-		case <-ctx.Done():
-			t.Fatalf("waiting for pod with %q on %s: %v", labelSelector, nodeName, ctx.Err())
-		case <-time.After(2 * time.Second):
-		}
+		time.Sleep(interval)
 	}
 }
 

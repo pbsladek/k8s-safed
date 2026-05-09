@@ -86,6 +86,45 @@ func TestDrain_DaemonSetEvictionOverrideDryRun(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// TestDrain_DaemonSetEvictionOverride
+// --------------------------------------------------------------------------
+
+func TestDrain_DaemonSetEvictionOverride(t *testing.T) {
+	waitAllReady(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancel()
+
+	target := firstAgentNode(t, ctx)
+	defer uncordon(t, target)
+
+	if err := framework.ApplyManifest(ctx, testCluster.KubeconfigPath, framework.DaemonSetManifest); err != nil {
+		t.Fatalf("apply daemonset: %v", err)
+	}
+	defer func() {
+		cleanupManifest(t, framework.DaemonSetManifest)
+	}()
+	waitForPodWithSelectorOnNode(t, ctx, target, framework.E2ENamespace, "app=node-agent", 90*time.Second)
+	podName, podUID := runningPodWithSelectorOnNode(t, ctx, target, framework.E2ENamespace, "app=node-agent")
+
+	result := testBinary.Drain(ctx, target,
+		"--preflight", "off",
+		"--ignore-daemonsets=false",
+		"--only-workload", "Deployment/e2e/does-not-exist",
+		"--poll-interval", "1s",
+	)
+	if result.Err != nil {
+		t.Fatalf("daemonset eviction override failed: %v\nstdout: %s\nstderr: %s", result.Err, result.Stdout, result.Stderr)
+	}
+	verifyNodeCordoned(t, target)
+	if !strings.Contains(result.Stdout, "Pod/e2e/node-agent") ||
+		!strings.Contains(result.Stdout, "Evicted") {
+		t.Fatalf("output missing DaemonSet eviction\nstdout: %s", result.Stdout)
+	}
+	waitForPodUIDGone(t, ctx, framework.E2ENamespace, podName, podUID, 60*time.Second)
+}
+
+// --------------------------------------------------------------------------
 // TestDrain_UnmanagedPodEvictionOptions
 // --------------------------------------------------------------------------
 

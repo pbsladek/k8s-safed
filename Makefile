@@ -6,6 +6,7 @@ GO_ROOT    ?= $(shell $(GO) env GOROOT 2>/dev/null)
 GO_ENV     := env "PATH=$(GO_ROOT)/bin:$(PATH)" "GOROOT=$(GO_ROOT)"
 GOFLAGS    := -trimpath
 LDFLAGS    := -s -w
+COVERAGE_THRESHOLD ?= 55.0
 
 # Respect GOBIN / PATH install location; default to /usr/local/bin.
 INSTALL_DIR ?= /usr/local/bin
@@ -32,7 +33,8 @@ test-v: ## Run all tests verbose
 
 test-coverage: ## Run unit tests with coverage report at coverage.out
 	$(GO) test -race -covermode=atomic -coverprofile=coverage.out ./...
-	$(GO) tool cover -func=coverage.out
+	@total=$$($(GO) tool cover -func=coverage.out | tee /dev/stderr | awk '/^total:/ {gsub(/%/,"",$$3); print $$3}'); \
+	awk -v total="$$total" -v min="$(COVERAGE_THRESHOLD)" 'BEGIN { if (total + 0 < min + 0) { printf("coverage %.1f%% below threshold %.1f%%\n", total, min); exit 1 } }'
 
 vet: ## Run go vet
 	$(GO) vet ./...
@@ -54,6 +56,7 @@ E2E_TIMEOUT ?= 35m
 E2E_FLAGS   ?= -v -tags=e2e -count=1 -timeout=$(E2E_TIMEOUT)
 E2E_PKG     ?= ./e2e/...
 E2E_ENV     ?= SAFED_E2E_GO=$(GO)
+E2E_PR_TESTS := TestDrain_(DryRun|Grafana|NATS|ConfigValidationAndModeErrors|CheckpointResume|SkipWorkload|OnlyWorkload|UncordonOnFailure|RBACMissingNodePatchFailsBeforeMutation|PDBAllowedEviction|EmitEventsFailure)$$
 
 e2e: ## Run e2e tests against a real k3d cluster (requires k3d in PATH)
 	$(MAKE) e2e-full
@@ -62,7 +65,7 @@ e2e-full: ## Run the complete e2e suite
 	$(E2E_ENV) $(GO) test $(E2E_FLAGS) $(E2E_PKG)
 
 e2e-pr: ## Run short PR-oriented e2e coverage
-	$(E2E_ENV) $(GO) test $(E2E_FLAGS) -run 'TestDrain_(DryRun|ConfigValidationAndModeErrors|RBACMissingNodePatchFailsBeforeMutation|PDBAllowedEviction|EmitEventsFailure)$$' $(E2E_PKG)
+	$(E2E_ENV) $(GO) test $(E2E_FLAGS) -run '$(E2E_PR_TESTS)' $(E2E_PKG)
 
 e2e-core: ## Run core e2e coverage suitable for PR validation
 	$(E2E_ENV) $(GO) test $(E2E_FLAGS) -run 'TestDrain_(DryRun|NATS|Grafana|MultipleWorkloads|Preflight_StrictMode|ConfigDefaultsModeProfilePrecedence|CheckpointResume|CorruptCheckpointFailsBeforeCordon|RBACMissingNodePatchFailsBeforeMutation|PDBAllowedEviction)$$' $(E2E_PKG)

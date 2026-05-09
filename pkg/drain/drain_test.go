@@ -375,7 +375,7 @@ func TestEvictRemaining_DryRunWarnsButDoesNotFailOnBlockedPods(t *testing.T) {
 		o.DryRun = true
 	})
 
-	if err := d.evictRemaining(t.Context()); err != nil {
+	if err := d.evictRemaining(t.Context(), &runState{}); err != nil {
 		t.Fatalf("dry-run should not fail on blocked remaining pods: %v", err)
 	}
 }
@@ -393,14 +393,14 @@ func TestEvictRemaining_ProtectedWorkloadPodIsLeftUntouched(t *testing.T) {
 	}
 	fakeCS := fake.NewClientset(&pod)
 	d := newTestDrainer(t, "node1", fakeCS)
-	d.protectedWorkloads = []workload.Workload{{
+	state := &runState{protectedWorkloads: []workload.Workload{{
 		Kind:      workload.KindDeployment,
 		Namespace: "default",
 		Name:      "api",
 		Selector:  &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
-	}}
+	}}}
 
-	if err := d.evictRemaining(t.Context()); err != nil {
+	if err := d.evictRemaining(t.Context(), state); err != nil {
 		t.Fatalf("protected workload pod should not be evicted: %v", err)
 	}
 	for _, action := range fakeCS.Actions() {
@@ -1071,7 +1071,8 @@ func TestFilterWorkloads_NoFilter_ReturnsAll(t *testing.T) {
 		makeWorkload(workload.KindDeployment, "default", "api"),
 		makeWorkload(workload.KindStatefulSet, "default", "db"),
 	}
-	got := d.filterWorkloads(wls)
+	state := &runState{}
+	got := d.filterWorkloads(state, wls)
 	if len(got) != 2 {
 		t.Errorf("expected 2 workloads with no filter, got %d", len(got))
 	}
@@ -1087,15 +1088,16 @@ func TestFilterWorkloads_SkipWorkload_Removes(t *testing.T) {
 		makeWorkload(workload.KindDeployment, "default", "api"),
 		makeWorkload(workload.KindStatefulSet, "default", "db"),
 	}
-	got := d.filterWorkloads(wls)
+	state := &runState{}
+	got := d.filterWorkloads(state, wls)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 workload after skip, got %d", len(got))
 	}
 	if got[0].Name != "db" {
 		t.Errorf("expected remaining workload to be 'db', got %q", got[0].Name)
 	}
-	if len(d.protectedWorkloads) != 1 || d.protectedWorkloads[0].Name != "api" {
-		t.Fatalf("protected workloads = %#v, want api", d.protectedWorkloads)
+	if len(state.protectedWorkloads) != 1 || state.protectedWorkloads[0].Name != "api" {
+		t.Fatalf("protected workloads = %#v, want api", state.protectedWorkloads)
 	}
 }
 
@@ -1110,15 +1112,16 @@ func TestFilterWorkloads_OnlyWorkload_KeepsOnlyNamed(t *testing.T) {
 		makeWorkload(workload.KindStatefulSet, "default", "db"),
 		makeWorkload(workload.KindDeployment, "default", "worker"),
 	}
-	got := d.filterWorkloads(wls)
+	state := &runState{}
+	got := d.filterWorkloads(state, wls)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 workload after only filter, got %d", len(got))
 	}
 	if got[0].Name != "db" {
 		t.Errorf("expected 'db', got %q", got[0].Name)
 	}
-	if len(d.protectedWorkloads) != 2 {
-		t.Fatalf("protected workloads = %#v, want api and worker", d.protectedWorkloads)
+	if len(state.protectedWorkloads) != 2 {
+		t.Fatalf("protected workloads = %#v, want api and worker", state.protectedWorkloads)
 	}
 }
 
@@ -1135,12 +1138,13 @@ func TestFilterWorkloads_SkipAll_ReturnsEmpty(t *testing.T) {
 		makeWorkload(workload.KindDeployment, "default", "api"),
 		makeWorkload(workload.KindStatefulSet, "default", "db"),
 	}
-	got := d.filterWorkloads(wls)
+	state := &runState{}
+	got := d.filterWorkloads(state, wls)
 	if len(got) != 0 {
 		t.Errorf("expected 0 workloads after skipping all, got %d", len(got))
 	}
-	if len(d.protectedWorkloads) != 2 {
-		t.Fatalf("protected workloads = %#v, want both workloads", d.protectedWorkloads)
+	if len(state.protectedWorkloads) != 2 {
+		t.Fatalf("protected workloads = %#v, want both workloads", state.protectedWorkloads)
 	}
 }
 

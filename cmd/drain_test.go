@@ -12,8 +12,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/pbsladek/k8s-safed/internal/drainapp"
 	"github.com/pbsladek/k8s-safed/pkg/k8s"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 func TestValidateDrainOptions_Defaults(t *testing.T) {
@@ -31,6 +33,25 @@ func TestValidateDrainOptions_Defaults(t *testing.T) {
 	}
 	if err := validateDrainOptions(opts); err != nil {
 		t.Fatalf("defaults should validate: %v", err)
+	}
+}
+
+func TestDrainOptionSpecsMatchCommandFlags(t *testing.T) {
+	cmd := NewDrainCommand()
+	got := map[string]bool{}
+	cmd.Flags().VisitAll(func(flag *pflag.Flag) {
+		got[flag.Name] = true
+	})
+	want := publicDrainOptionNames(true)
+	for name := range want {
+		if !got[name] {
+			t.Errorf("drainOptionSpecs contains %q but command flag is missing", name)
+		}
+	}
+	for name := range got {
+		if !want[name] {
+			t.Errorf("command flag %q is missing from drainOptionSpecs", name)
+		}
 	}
 }
 
@@ -190,6 +211,37 @@ func TestValidateDrainTargets_AllowsCustomCheckpointPathForSingleNode(t *testing
 	}
 }
 
+func TestDrainCommand_RequiresNodeOrSelector(t *testing.T) {
+	cmd := NewDrainCommand()
+	cmd.SetArgs([]string{"--dry-run"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "must specify at least one node name or --selector") {
+		t.Fatalf("err = %v, want missing target validation", err)
+	}
+}
+
+func TestDrainCommand_RejectsNodeAndSelector(t *testing.T) {
+	cmd := NewDrainCommand()
+	cmd.SetArgs([]string{"node-a", "--selector", "pool=spot"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "cannot specify both node names and --selector") {
+		t.Fatalf("err = %v, want node plus selector validation", err)
+	}
+}
+
+func TestDrainCommand_RejectsSkipAndOnlyWorkload(t *testing.T) {
+	cmd := NewDrainCommand()
+	cmd.SetArgs([]string{
+		"node-a",
+		"--skip-workload", "Deployment/default/api",
+		"--only-workload", "Deployment/default/api",
+	})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "cannot use both --skip-workload and --only-workload") {
+		t.Fatalf("err = %v, want skip/only validation", err)
+	}
+}
+
 func TestApplyConfig_DefaultsModeProfileOrder(t *testing.T) {
 	cfgPath := writeDrainConfig(t, `
 defaults:
@@ -228,6 +280,27 @@ profiles:
 	}
 	if got := strings.Join(opts.statefulNamePatterns, ","); got != "ledger,temporal" {
 		t.Errorf("statefulNamePatterns = %q, want ledger,temporal", got)
+	}
+}
+
+func TestApplyConfig_MissingDefaultConfigIgnoredWithoutProfile(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("KUBECTL_SAFED_CONFIG", "")
+	opts := defaultDrainOptionsForTest()
+
+	if err := applyConfig(drainCommandForConfigTest(), opts); err != nil {
+		t.Fatalf("missing default config should be ignored without profile: %v", err)
+	}
+}
+
+func TestApplyConfig_EnvConfigMissingReturnsError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.yaml")
+	t.Setenv("KUBECTL_SAFED_CONFIG", path)
+	opts := defaultDrainOptionsForTest()
+
+	err := applyConfig(drainCommandForConfigTest(), opts)
+	if err == nil || !strings.Contains(err.Error(), "reading config file") {
+		t.Fatalf("err = %v, want missing env config error", err)
 	}
 }
 
@@ -336,7 +409,7 @@ func TestResolveNodeNames_SelectorReturnsSortedMatches(t *testing.T) {
 		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-c", Labels: map[string]string{"pool": "ondemand"}}},
 	)}
 
-	got, err := resolveNodeNames(context.Background(), client, nil, "pool=spot")
+	got, err := drainapp.ResolveNodeNames(context.Background(), client, nil, "pool=spot")
 	if err != nil {
 		t.Fatalf("resolveNodeNames: %v", err)
 	}
@@ -350,7 +423,7 @@ func TestResolveNodeNames_SelectorNoMatches(t *testing.T) {
 		&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{"pool": "ondemand"}}},
 	)}
 
-	_, err := resolveNodeNames(context.Background(), client, nil, "pool=spot")
+	_, err := drainapp.ResolveNodeNames(context.Background(), client, nil, "pool=spot")
 	if err == nil || !strings.Contains(err.Error(), "no nodes matched selector") {
 		t.Fatalf("err = %v, want no-match error", err)
 	}

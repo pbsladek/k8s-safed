@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/pbsladek/k8s-safed/pkg/k8s"
@@ -81,8 +79,8 @@ type Options struct {
 	// preflight to surface known stateful workloads.
 	StatefulNamePatterns []string
 	// SkipWorkloads is a set of "Kind/namespace/name" keys to exclude from
-	// rolling restarts. Skipped workloads still fall through to eviction normally.
-	// Mutually exclusive with OnlyWorkloads.
+	// rolling restarts and conventional eviction. Mutually exclusive with
+	// OnlyWorkloads.
 	SkipWorkloads map[string]bool
 	// OnlyWorkloads restricts rolling restarts to exactly this set of
 	// "Kind/namespace/name" keys; all others are left untouched.
@@ -107,24 +105,30 @@ type Options struct {
 	// WorkloadCoordinator deduplicates rolling restarts across concurrent node
 	// drains in the same process. Each node still verifies that its own pods left.
 	WorkloadCoordinator *WorkloadCoordinator
+	// Clock provides time for timestamps, elapsed durations, and retry sleeps.
+	// Nil uses the real wall clock. Kept internal to the package so tests can
+	// make output and checkpoint data deterministic without exposing public API.
+	clock clock
 }
 
 // Drainer orchestrates the safe drain sequence.
 type Drainer struct {
-	opts               Options
-	client             kubernetes.Interface
-	finder             *workload.Finder
-	events             *EventEmitter
-	protectedWorkloads []workload.Workload
+	opts   Options
+	client kubernetes.Interface
+	finder *workload.Finder
+	events *EventEmitter
+	clock  clock
 }
 
 // NewDrainer creates a Drainer from the provided options.
 func NewDrainer(opts Options) *Drainer {
+	clk := defaultClock(opts.clock)
 	return &Drainer{
 		opts:   opts,
 		client: opts.Client.Kubernetes,
 		finder: workload.NewFinder(opts.Client.Kubernetes),
-		events: NewEventEmitter(opts.Client.Kubernetes, opts.Out, opts.EmitEvents && !opts.DryRun),
+		events: NewEventEmitterWithClock(opts.Client.Kubernetes, opts.Out, opts.EmitEvents && !opts.DryRun, clk),
+		clock:  clk,
 	}
 }
 
@@ -153,82 +157,32 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 	}
 
 	out := d.opts.Out
-	start := time.Now()
+	start := d.now()
+	state := &runState{}
 
-	// Step 1: Validate node.
-	out.Infof(d.opts.NodeName, "Validating %q", d.opts.NodeName)
-	var node *corev1.Node
-	if err := retryTransient(ctx, d.pollInterval(), func() error {
-		var e error
-		node, e = d.nodes().Get(ctx, d.opts.NodeName, metav1.GetOptions{})
-		return e
-	}); err != nil {
-		return fmt.Errorf("node %q not found: %w", d.opts.NodeName, err)
-	}
-	out.Infof(d.opts.NodeName, "Found · kernel=%s ready=%v",
-		node.Status.NodeInfo.KernelVersion, isNodeReady(node))
-
-	// Step 2: Discover workloads — before any cluster changes so pre-flight
-	// can see the full picture and the operator can abort without side effects.
-	out.Info(d.opts.NodeName, "Discovering managed workloads...")
-	var workloads []workload.Workload
-	if err := retryTransient(ctx, d.pollInterval(), func() error {
-		var e error
-		workloads, e = d.finder.FindForNode(ctx, d.opts.NodeName)
-		return e
-	}); err != nil {
-		return fmt.Errorf("discovering workloads: %w", err)
-	}
-
-	if len(workloads) == 0 {
-		out.Info(d.opts.NodeName, "No managed workloads found")
-	} else {
-		out.Infof(d.opts.NodeName, "Found %d managed workload(s) to restart:", len(workloads))
-		for _, w := range workloads {
-			out.Infof(d.opts.NodeName, "  · %s", w)
-		}
-	}
-
-	// Filter workloads per --skip-workload / --only-workload before pre-flight
-	// so pre-flight only scans workloads that will actually be restarted.
-	// Excluded managed workloads are also protected from conventional eviction;
-	// these flags mean "leave this workload alone", not merely "avoid restart".
-	workloads = d.filterWorkloads(workloads)
-	d.warnInvalidPriorityAnnotations(workloads)
-
-	// Step 3: Pre-flight checks — surface risks before making any cluster changes.
-	if d.opts.Preflight != PreflightModeOff {
-		if err := d.runPreflight(ctx, workloads); err != nil {
-			return err
-		}
-	}
-
-	// Validate resume metadata before cordoning. A bad checkpoint is an input
-	// error, not a drain failure, so it must not make the node unschedulable.
-	if d.opts.Resume && d.opts.CheckpointPath != "" {
-		cp, err := LoadCheckpoint(d.opts.CheckpointPath)
-		if err != nil {
-			return fmt.Errorf("loading checkpoint: %w", err)
-		}
-		if err := d.validateCheckpoint(cp); err != nil {
-			return err
-		}
-	}
-
-	// Step 4: Cordon.
-	cordonedByUs, err := d.cordon(ctx, node)
+	node, err := d.validateNode(ctx)
 	if err != nil {
 		return err
 	}
-	d.events.NodeEvent(ctx, d.opts.NodeName, "Draining",
-		fmt.Sprintf("kubectl-safed: beginning drain of %q (%d workload(s))", d.opts.NodeName, len(workloads)),
-		corev1.EventTypeNormal)
+
+	workloads, err := d.discoverWorkloads(ctx)
+	if err != nil {
+		return err
+	}
+
+	workloads, err = d.prepareBeforeCordon(ctx, state, workloads)
+	if err != nil {
+		return err
+	}
+
+	cordonedByUs, err := d.beginCordonedDrain(ctx, node, len(workloads))
+	if err != nil {
+		return err
+	}
 	// Emit DrainFailed event on any error path after the cordon.
 	defer func() {
 		if retErr != nil {
-			d.events.NodeEvent(context.Background(), d.opts.NodeName, "DrainFailed",
-				fmt.Sprintf("kubectl-safed: drain of %q failed: %v", d.opts.NodeName, retErr),
-				corev1.EventTypeWarning)
+			d.emitDrainFailed(retErr)
 		}
 	}()
 	// If UncordonOnFailure is set and we were the ones who cordoned the node,
@@ -248,7 +202,7 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 	}
 
 	// Step 6: Evict remaining pods.
-	if err := d.evictRemaining(ctx); err != nil {
+	if err := d.evictRemaining(ctx, state); err != nil {
 		return err
 	}
 
@@ -259,19 +213,14 @@ func (d *Drainer) Run(ctx context.Context) (retErr error) {
 		}
 	}
 
-	if d.opts.DryRun {
-		out.DryRunf(d.opts.NodeName, "Dry-run complete — no changes were made to %q", d.opts.NodeName)
-	} else {
-		elapsed := time.Since(start).Round(time.Second)
-		if len(d.protectedWorkloads) > 0 {
-			out.Warnf(d.opts.NodeName, "%d filtered managed workload(s) were left untouched; node may still have pods by design", len(d.protectedWorkloads))
-		}
-		// Use context.Background() so the event is reliably emitted even if
-		// the drain context expired right as the last workload completed.
-		d.events.NodeEvent(context.Background(), d.opts.NodeName, "Drained",
-			fmt.Sprintf("kubectl-safed: drain of %q complete (%s)", d.opts.NodeName, elapsed),
-			corev1.EventTypeNormal)
-		out.Elapsed(start, d.opts.NodeName, fmt.Sprintf("Drained %q", d.opts.NodeName))
-	}
+	d.finishSuccessfulDrain(start, state)
 	return nil
+}
+
+func (d *Drainer) now() time.Time {
+	return d.clock.Now()
+}
+
+func (d *Drainer) after(duration time.Duration) <-chan time.Time {
+	return d.clock.After(duration)
 }

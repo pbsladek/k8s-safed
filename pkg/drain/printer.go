@@ -131,7 +131,11 @@ func (p *Printer) Warnf(subject, format string, args ...any) {
 
 // Elapsed logs a completion message with the duration since since appended.
 func (p *Printer) Elapsed(since time.Time, subject, msg string) {
-	elapsed := time.Since(since).Round(time.Millisecond)
+	nowFn := p.now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	elapsed := nowFn().Sub(since).Round(time.Millisecond)
 	p.emit("done", subject, fmt.Sprintf("%s (%s)", msg, elapsed))
 }
 

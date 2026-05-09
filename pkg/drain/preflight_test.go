@@ -2,6 +2,7 @@ package drain
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -86,6 +87,15 @@ func makeDeploymentForPreflight(ns, name string, replicas int32, strategy appsv1
 	return dep
 }
 
+func hasRiskContaining(issues []preflightIssue, want string) bool {
+	for _, issue := range issues {
+		if issue.risk && strings.Contains(issue.message, want) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestPreflightDeployment_SingleReplica_IsRisk(t *testing.T) {
 	dep := makeDeploymentForPreflight("default", "api", 1, appsv1.RollingUpdateDeploymentStrategyType)
 	fakeCS := fake.NewClientset(&dep)
@@ -139,6 +149,22 @@ func TestPreflightDeployment_RecreateStrategy_IsRisk(t *testing.T) {
 	}
 	if !hasRecreateRisk {
 		t.Error("expected risk issue for Recreate strategy")
+	}
+}
+
+func TestPreflightDeployment_Paused_IsRisk(t *testing.T) {
+	dep := makeDeploymentForPreflight("default", "api", 3, appsv1.RollingUpdateDeploymentStrategyType)
+	dep.Spec.Paused = true
+	fakeCS := fake.NewClientset(&dep)
+	d := newTestDrainer(t, "node1", fakeCS)
+
+	w := workload.Workload{Kind: workload.KindDeployment, Namespace: "default", Name: "api"}
+	issues, err := d.preflightDeployment(context.Background(), w, wSubject(w))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !hasRiskContaining(issues, "paused Deployment") {
+		t.Fatalf("expected paused Deployment risk, got %#v", issues)
 	}
 }
 
@@ -207,6 +233,42 @@ func TestPreflightStatefulSet_MultiReplica_IsNote(t *testing.T) {
 	}
 	if issues[0].risk {
 		t.Error("multi-replica StatefulSet issue should be risk=false")
+	}
+}
+
+func TestPreflightStatefulSet_OnDelete_IsRisk(t *testing.T) {
+	sts := makeStatefulSetForPreflight("default", "db", 3)
+	sts.Spec.UpdateStrategy.Type = appsv1.OnDeleteStatefulSetStrategyType
+	fakeCS := fake.NewClientset(&sts)
+	d := newTestDrainer(t, "node1", fakeCS)
+
+	w := workload.Workload{Kind: workload.KindStatefulSet, Namespace: "default", Name: "db"}
+	issues, err := d.preflightStatefulSet(context.Background(), w, wSubject(w))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !hasRiskContaining(issues, "OnDelete update strategy") {
+		t.Fatalf("expected OnDelete risk, got %#v", issues)
+	}
+}
+
+func TestPreflightStatefulSet_PartitionedRollout_IsRisk(t *testing.T) {
+	sts := makeStatefulSetForPreflight("default", "db", 3)
+	partition := int32(1)
+	sts.Spec.UpdateStrategy.Type = appsv1.RollingUpdateStatefulSetStrategyType
+	sts.Spec.UpdateStrategy.RollingUpdate = &appsv1.RollingUpdateStatefulSetStrategy{
+		Partition: &partition,
+	}
+	fakeCS := fake.NewClientset(&sts)
+	d := newTestDrainer(t, "node1", fakeCS)
+
+	w := workload.Workload{Kind: workload.KindStatefulSet, Namespace: "default", Name: "db"}
+	issues, err := d.preflightStatefulSet(context.Background(), w, wSubject(w))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !hasRiskContaining(issues, "partitioned StatefulSet rollout") {
+		t.Fatalf("expected partitioned rollout risk, got %#v", issues)
 	}
 }
 

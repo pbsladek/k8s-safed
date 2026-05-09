@@ -19,7 +19,7 @@ import (
 // evictRemaining evicts pods left on the node after rolling restarts complete.
 // What gets evicted is controlled by the SkipDaemonSets, Force, and
 // DeleteEmptyDir options.
-func (d *Drainer) evictRemaining(ctx context.Context) error {
+func (d *Drainer) evictRemaining(ctx context.Context, state *runState) error {
 	out := d.opts.Out
 
 	pods, err := d.pods("").List(ctx, metav1.ListOptions{
@@ -28,7 +28,7 @@ func (d *Drainer) evictRemaining(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listing remaining pods on %q: %w", d.opts.NodeName, err)
 	}
-	candidates := d.excludeProtectedPods(pods.Items)
+	candidates := d.excludeProtectedPods(state, pods.Items)
 
 	blocked := blockedEvictionPods(candidates, d.opts.SkipDaemonSets, d.opts.Force, d.opts.DeleteEmptyDir)
 	if len(blocked) > 0 {
@@ -93,14 +93,14 @@ func (d *Drainer) evictRemaining(ctx context.Context) error {
 	return d.waitForPodsDeleted(ctx, append(waiting, evictable...), d.podVacateTimeout())
 }
 
-func (d *Drainer) excludeProtectedPods(pods []corev1.Pod) []corev1.Pod {
-	if len(d.protectedWorkloads) == 0 {
+func (d *Drainer) excludeProtectedPods(state *runState, pods []corev1.Pod) []corev1.Pod {
+	if len(state.protectedWorkloads) == 0 {
 		return pods
 	}
 	out := make([]corev1.Pod, 0, len(pods))
 	for i := range pods {
 		pod := &pods[i]
-		if protected := d.protectedWorkloadForPod(pod); protected != "" {
+		if protected := d.protectedWorkloadForPod(state, pod); protected != "" {
 			d.opts.Out.Infof(d.opts.NodeName, "Leaving %s/%s untouched (%s is filtered)", pod.Namespace, pod.Name, protected)
 			continue
 		}
@@ -109,8 +109,8 @@ func (d *Drainer) excludeProtectedPods(pods []corev1.Pod) []corev1.Pod {
 	return out
 }
 
-func (d *Drainer) protectedWorkloadForPod(pod *corev1.Pod) string {
-	for _, w := range d.protectedWorkloads {
+func (d *Drainer) protectedWorkloadForPod(state *runState, pod *corev1.Pod) string {
+	for _, w := range state.protectedWorkloads {
 		if pod.Namespace != w.Namespace || w.Selector == nil {
 			continue
 		}
@@ -152,7 +152,7 @@ func (d *Drainer) evictWithPDBRetry(ctx context.Context, out *Printer, subj stri
 			case <-evictCtx.Done():
 				return fmt.Errorf("evicting pod %s/%s: timed out waiting for PDB after %d attempt(s): %w",
 					pod.Namespace, pod.Name, attempt, evictCtx.Err())
-			case <-time.After(interval):
+			case <-d.after(interval):
 				// Exponential backoff capped at maxInterval.
 				interval *= 2
 				if interval > maxInterval {

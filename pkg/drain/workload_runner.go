@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"sync"
-	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -80,7 +79,7 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 		defer cpMu.Unlock()
 		cp.NodeName = d.opts.NodeName
 		cp.Context = d.opts.CheckpointContext
-		cp.MarkDone(w)
+		cp.MarkDoneAt(w, d.now())
 		if err := cp.Save(d.opts.CheckpointPath); err != nil {
 			d.opts.Out.Warnf(d.opts.NodeName, "failed to save checkpoint: %v", err)
 		}
@@ -92,7 +91,7 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 	// Sequential path: one workload at a time with step counters.
 	if maxC == 1 {
 		for i, w := range workloads {
-			t0 := time.Now()
+			t0 := d.now()
 			out.Startf(wSubject(w), "Rolling restart [%d/%d]", i+1, len(workloads))
 			if err := d.rollingRestart(ctx, w); err != nil {
 				return err
@@ -133,7 +132,7 @@ func (d *Drainer) runWorkloads(ctx context.Context, workloads []workload.Workloa
 		for _, w := range batch {
 			w := w // capture loop variable
 			g.Go(func() error {
-				t0 := time.Now()
+				t0 := d.now()
 				out.Start(wSubject(w), "Rolling restart")
 				if err := d.rollingRestart(gctx, w); err != nil {
 					return err

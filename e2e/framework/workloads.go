@@ -27,6 +27,7 @@ type DeploymentManifestOptions struct {
 	Image                   string
 	Command                 string
 	ReadinessCommand        string
+	Paused                  bool
 }
 
 // StatefulSetManifestOptions describes a small StatefulSet used by e2e tests.
@@ -37,6 +38,8 @@ type StatefulSetManifestOptions struct {
 	Replicas  int32
 	Image     string
 	Command   string
+	OnDelete  bool
+	Partition *int32
 }
 
 // --------------------------------------------------------------------------
@@ -60,6 +63,7 @@ func DeploymentManifest(opts DeploymentManifestOptions) string {
 		Command:                 defaultString(opts.Command, sleepCommand),
 		MemoryRequest:           "16Mi",
 		ReadinessCommand:        opts.ReadinessCommand,
+		Paused:                  opts.Paused,
 	}
 	return renderManifest(deploymentTemplate, data)
 }
@@ -77,6 +81,8 @@ func StatefulSetManifest(opts StatefulSetManifestOptions) string {
 		Image:                   defaultString(opts.Image, busyboxImage),
 		Command:                 defaultString(opts.Command, sleepCommand),
 		MemoryRequest:           "16Mi",
+		OnDelete:                opts.OnDelete,
+		Partition:               opts.Partition,
 	}
 	return renderManifest(statefulSetTemplate, data)
 }
@@ -167,6 +173,7 @@ type deploymentTemplateData struct {
 	Command                 string
 	MemoryRequest           string
 	ReadinessCommand        string
+	Paused                  bool
 }
 
 type statefulSetTemplateData struct {
@@ -180,6 +187,8 @@ type statefulSetTemplateData struct {
 	Image                   string
 	Command                 string
 	MemoryRequest           string
+	OnDelete                bool
+	Partition               *int32
 }
 
 type podTemplateData struct {

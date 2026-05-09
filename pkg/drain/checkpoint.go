@@ -113,6 +113,11 @@ func (c *Checkpoint) Save(path string) error {
 
 // MarkDone records w as completed in the checkpoint.
 func (c *Checkpoint) MarkDone(w workload.Workload) {
+	c.MarkDoneAt(w, time.Now().UTC())
+}
+
+// MarkDoneAt records w as completed with an explicit timestamp.
+func (c *Checkpoint) MarkDoneAt(w workload.Workload, completedAt time.Time) {
 	key := workloadKey(w)
 	if c.Completed == nil {
 		c.Completed = make(map[string]bool)
@@ -127,7 +132,7 @@ func (c *Checkpoint) MarkDone(w workload.Workload) {
 		Name:        w.Name,
 		UID:         string(w.UID),
 		Generation:  w.Generation,
-		CompletedAt: time.Now().UTC(),
+		CompletedAt: completedAt.UTC(),
 	}
 }
 

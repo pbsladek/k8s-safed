@@ -231,8 +231,9 @@ kubectl safed drain worker-1 \
   --only-workload=StatefulSet/data/postgres
 ```
 
-Filtered-out workloads are not rolling-restarted. Pods remaining on the node
-still fall through to the remaining-pod handling phase.
+Filtered-out managed workloads are left untouched by both rolling restart and
+conventional eviction. The drain can finish with those pods still on the node by
+design.
 
 ## Remaining Pods
 

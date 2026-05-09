@@ -187,6 +187,13 @@ func (d *Drainer) preflightDeployment(ctx context.Context, w workload.Workload, 
 			risk:    true,
 		})
 	}
+	if dep.Spec.Paused {
+		issues = append(issues, preflightIssue{
+			subject: subj,
+			message: "paused Deployment — restart patch will not progress until the Deployment is resumed",
+			risk:    true,
+		})
+	}
 
 	return issues, nil
 }
@@ -222,6 +229,23 @@ func (d *Drainer) preflightStatefulSet(ctx context.Context, w workload.Workload,
 				replicas,
 			),
 			risk: false,
+		})
+	}
+	if sts.Spec.UpdateStrategy.Type == appsv1.OnDeleteStatefulSetStrategyType {
+		issues = append(issues, preflightIssue{
+			subject: subj,
+			message: "OnDelete update strategy — restart patch will not replace pods automatically",
+			risk:    true,
+		})
+	}
+	if sts.Spec.UpdateStrategy.RollingUpdate != nil &&
+		sts.Spec.UpdateStrategy.RollingUpdate.Partition != nil &&
+		*sts.Spec.UpdateStrategy.RollingUpdate.Partition > 0 {
+		issues = append(issues, preflightIssue{
+			subject: subj,
+			message: fmt.Sprintf("partitioned StatefulSet rollout (partition=%d) — lower ordinals will not be restarted by the patch",
+				*sts.Spec.UpdateStrategy.RollingUpdate.Partition),
+			risk: true,
 		})
 	}
 

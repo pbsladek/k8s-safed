@@ -2,11 +2,14 @@ package examples
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/pbsladek/k8s-safed/cmd"
 	"github.com/pbsladek/k8s-safed/pkg/config"
+	"github.com/spf13/pflag"
 	sigsyaml "sigs.k8s.io/yaml"
 )
 
@@ -61,14 +64,34 @@ func TestRBACExampleContainsRequiredRules(t *testing.T) {
 	}
 }
 
-func TestReadmeCommandBlocksUseCurrentFlags(t *testing.T) {
-	data, err := os.ReadFile("README.md")
-	if err != nil {
-		t.Fatalf("read README.md: %v", err)
+func TestMarkdownDrainExamplesUseCurrentFlags(t *testing.T) {
+	drainCmd := cmd.NewDrainCommand()
+	allowed := map[string]bool{
+		"context": true, // kubeconfig persistent flag commonly shown with plugins
 	}
-	for _, block := range markdownCodeBlocks(string(data), "bash") {
-		if strings.Contains(block, "--skip-daemon-sets") {
-			t.Fatalf("README.md uses removed flag spelling in block:\n%s", block)
+	drainCmd.Flags().VisitAll(func(flag *pflag.Flag) {
+		allowed[flag.Name] = true
+	})
+
+	for _, path := range []string{
+		filepath.Join("..", "..", "README.md"),
+		filepath.Join("..", "user-guide.md"),
+		filepath.Join("..", "index.md"),
+		"README.md",
+	} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		for _, command := range markdownDrainCommands(string(data)) {
+			if strings.Contains(command, "--skip-daemon-sets") {
+				t.Fatalf("%s uses hidden compatibility flag spelling in command:\n%s", path, command)
+			}
+			for _, flag := range flagsInCommand(command) {
+				if !allowed[flag] {
+					t.Fatalf("%s documents unknown drain flag --%s in command:\n%s", path, flag, command)
+				}
+			}
 		}
 	}
 }
@@ -106,4 +129,29 @@ func markdownCodeBlocks(markdown, language string) []string {
 		}
 	}
 	return blocks
+}
+
+func markdownDrainCommands(markdown string) []string {
+	var commands []string
+	for _, block := range markdownCodeBlocks(markdown, "bash") {
+		normalized := strings.ReplaceAll(block, "\\\n", " ")
+		for _, line := range strings.Split(normalized, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.Contains(line, "kubectl safed drain") {
+				commands = append(commands, line)
+			}
+		}
+	}
+	return commands
+}
+
+var longFlagPattern = regexp.MustCompile(`(?:^|\s)--([A-Za-z0-9-]+)(?:[=\s]|$)`)
+
+func flagsInCommand(command string) []string {
+	matches := longFlagPattern.FindAllStringSubmatch(command, -1)
+	flags := make([]string, 0, len(matches))
+	for _, match := range matches {
+		flags = append(flags, match[1])
+	}
+	return flags
 }

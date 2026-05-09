@@ -7,8 +7,11 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/pbsladek/k8s-safed/pkg/workload"
 )
@@ -153,6 +156,55 @@ func TestFinder_FindForNode_Deployment(t *testing.T) {
 	}
 	if wls[0].Selector == nil {
 		t.Error("expected Selector to be set")
+	}
+}
+
+func TestFinder_FindForNode_ListsPodsWithNodeFieldSelector(t *testing.T) {
+	client := fake.NewClientset()
+	client.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		listAction := action.(k8stesting.ListAction)
+		got := listAction.GetListRestrictions().Fields.String()
+		if got != fields.OneTermEqualSelector("spec.nodeName", "node1").String() {
+			t.Fatalf("pod list field selector = %q, want spec.nodeName=node1", got)
+		}
+		return true, &corev1.PodList{}, nil
+	})
+	f := workload.NewFinder(client)
+
+	if _, err := f.FindForNode(context.Background(), "node1"); err != nil {
+		t.Fatalf("FindForNode: %v", err)
+	}
+}
+
+func TestFinder_FindForNode_IgnoresNonControllerOwnerReferences(t *testing.T) {
+	tests := []struct {
+		name       string
+		controller *bool
+	}{
+		{name: "nil controller", controller: nil},
+		{name: "false controller", controller: boolPtr(false)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dep := makeDeployment("default", "api")
+			rs := makeRS("default", "api-rs1", "api")
+			pod := makePod("default", "api-pod1", []metav1.OwnerReference{{
+				Kind:       "ReplicaSet",
+				Name:       "api-rs1",
+				UID:        testUID("ReplicaSet", "api-rs1"),
+				Controller: tc.controller,
+			}})
+
+			client := fake.NewClientset(&dep, &rs, &pod)
+			f := workload.NewFinder(client)
+			wls, err := f.FindForNode(context.Background(), "node1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(wls) != 0 {
+				t.Fatalf("expected non-controller owner to be ignored, got %#v", wls)
+			}
+		})
 	}
 }
 

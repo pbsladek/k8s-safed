@@ -8,8 +8,8 @@ import (
 
 // filterWorkloads applies SkipWorkloads / OnlyWorkloads filtering and logs
 // each exclusion. It is a no-op when both maps are empty.
-func (d *Drainer) filterWorkloads(workloads []workload.Workload) []workload.Workload {
-	d.protectedWorkloads = nil
+func (d *Drainer) filterWorkloads(state *runState, workloads []workload.Workload) []workload.Workload {
+	state.protectedWorkloads = nil
 	if len(d.opts.SkipWorkloads) == 0 && len(d.opts.OnlyWorkloads) == 0 {
 		return workloads
 	}
@@ -19,12 +19,12 @@ func (d *Drainer) filterWorkloads(workloads []workload.Workload) []workload.Work
 		key := fmt.Sprintf("%s/%s/%s", w.Kind, w.Namespace, w.Name)
 		if len(d.opts.OnlyWorkloads) > 0 && !d.opts.OnlyWorkloads[key] {
 			out.Infof(d.opts.NodeName, "Skipping %s (not in --only-workload list)", wSubject(w))
-			d.protectedWorkloads = append(d.protectedWorkloads, w)
+			state.protectedWorkloads = append(state.protectedWorkloads, w)
 			continue
 		}
 		if d.opts.SkipWorkloads[key] {
 			out.Infof(d.opts.NodeName, "Skipping %s (--skip-workload)", wSubject(w))
-			d.protectedWorkloads = append(d.protectedWorkloads, w)
+			state.protectedWorkloads = append(state.protectedWorkloads, w)
 			continue
 		}
 		filtered = append(filtered, w)

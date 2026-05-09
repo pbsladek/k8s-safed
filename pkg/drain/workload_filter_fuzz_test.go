@@ -26,12 +26,13 @@ func FuzzFilterWorkloads(f *testing.F) {
 		if workloadKey == "StatefulSet/data/postgres" {
 			w = workload.Workload{Kind: workload.KindStatefulSet, Namespace: "data", Name: "postgres"}
 		}
-		got := d.filterWorkloads([]workload.Workload{w})
+		state := &runState{}
+		got := d.filterWorkloads(state, []workload.Workload{w})
 		if len(got) > 1 {
 			t.Fatalf("filter returned too many workloads: %#v", got)
 		}
-		if len(got) == 0 && len(d.protectedWorkloads) != 1 {
-			t.Fatalf("filtered workload was not protected: got=%#v protected=%#v", got, d.protectedWorkloads)
+		if len(got) == 0 && len(state.protectedWorkloads) != 1 {
+			t.Fatalf("filtered workload was not protected: got=%#v protected=%#v", got, state.protectedWorkloads)
 		}
 	})
 }
