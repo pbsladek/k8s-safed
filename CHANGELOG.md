@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.0](https://github.com/pbsladek/k8s-safed/compare/v1.0.0...v1.1.0) (2026-05-25)
+
+
+### Features
+
+* **drain:** add --mode presets, config defaults, and --stateful-name-pattern flag ([5642464](https://github.com/pbsladek/k8s-safed/commit/56424645b00e11c97383a809136fc37d690cb059))
+* **drain:** add option validation, checkpoint improvements, and expa… ([6062f02](https://github.com/pbsladek/k8s-safed/commit/6062f020027d3959bc0b59e52d85869644b9ca32))
+* **drain:** add option validation, checkpoint improvements, and expanded e2e coverage ([09c16c4](https://github.com/pbsladek/k8s-safed/commit/09c16c47752741ecd601761b2fbe06519fba8441))
+* **drain:** add workload coordinator, protected eviction, and checkpoint identity validation ([c9c03b3](https://github.com/pbsladek/k8s-safed/commit/c9c03b3dda04856cc2c0e8853e3802517ed8f95e))
+
 ## 1.0.0 (2026-03-30)
 
 
