@@ -1,18 +1,11 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"github.com/pbsladek/k8s-safed/pkg/config"
-	"github.com/pbsladek/k8s-safed/pkg/drain"
-	"github.com/pbsladek/k8s-safed/pkg/k8s"
+	"github.com/pbsladek/k8s-safed/internal/drainapp"
 	"github.com/spf13/cobra"
 )
 
@@ -43,6 +36,9 @@ type drainOptions struct {
 	// Profile support.
 	profile    string
 	configFile string
+	mode       string
+	// Organization/application conventions.
+	statefulNamePatterns []string
 	// Event emission.
 	emitEvents bool
 	// Checkpoint / resume.
@@ -130,13 +126,17 @@ Examples:
 	cmd.Flags().StringVar(&opts.preflight, "preflight", "warn",
 		`Pre-flight check mode: "warn" (log risks, continue), "strict" (abort on any risk), "off" (skip all checks)`)
 	cmd.Flags().StringArrayVar(&opts.skipWorkloads, "skip-workload", nil,
-		`Exclude a workload from rolling restarts (format: Kind/namespace/name, e.g. Deployment/default/api). Repeatable. Mutually exclusive with --only-workload.`)
+		`Leave a managed workload untouched by restart and conventional eviction (format: Kind/namespace/name, e.g. Deployment/default/api). Repeatable. Mutually exclusive with --only-workload.`)
 	cmd.Flags().StringArrayVar(&opts.onlyWorkloads, "only-workload", nil,
-		`Restrict rolling restarts to these workloads only (format: Kind/namespace/name). Repeatable. Mutually exclusive with --skip-workload.`)
+		`Restart only these managed workloads and leave other managed workloads untouched (format: Kind/namespace/name). Repeatable. Mutually exclusive with --skip-workload.`)
 	cmd.Flags().StringVar(&opts.profile, "profile", "",
 		`Load flag defaults from a named profile in the safed config file (see --config). CLI flags override profile values.`)
 	cmd.Flags().StringVar(&opts.configFile, "config", "",
 		`Path to the safed config file (default: ~/.kube/safed.yaml; env: KUBECTL_SAFED_CONFIG)`)
+	cmd.Flags().StringVar(&opts.mode, "mode", "",
+		`Use a built-in drain mode: "prod", "scale-down", or "debug". CLI flags override mode values.`)
+	cmd.Flags().StringArrayVar(&opts.statefulNamePatterns, "stateful-name-pattern", nil,
+		`Add a custom pre-flight stateful workload name pattern. Repeatable. Also supported in config as stateful-name-patterns.`)
 	cmd.Flags().BoolVar(&opts.emitEvents, "emit-events", false,
 		"Emit Kubernetes Events to node and workload objects during drain (requires events/create RBAC permission)")
 	cmd.Flags().BoolVar(&opts.resume, "resume", false,
@@ -147,111 +147,92 @@ Examples:
 	return cmd
 }
 
-func runDrain(cmd *cobra.Command, nodeArgs []string, opts *drainOptions) error {
-	ctx := cmd.Context()
-	client, err := k8s.NewClient(kubeConfigFlags)
-	if err != nil {
-		return fmt.Errorf("failed to create Kubernetes client: %w", err)
-	}
+// NewDrainCommand returns a fresh drain command with its own option state.
+// It is primarily useful for tests and documentation validation that need to
+// inspect the public command surface without using the package-level root.
+func NewDrainCommand() *cobra.Command {
+	return newDrainCmd()
+}
 
-	nodes, err := resolveNodeNames(ctx, client, nodeArgs, opts.nodeSelector)
-	if err != nil {
+func toAppOptions(opts *drainOptions) drainapp.Options {
+	return drainapp.Options{
+		DryRun:                opts.dryRun,
+		Timeout:               opts.timeout,
+		SkipDaemonSets:        opts.skipDaemonSets,
+		DeleteEmptyDir:        opts.deleteEmptyDir,
+		GracePeriod:           opts.gracePeriod,
+		RolloutTimeout:        opts.rolloutTimeout,
+		PodVacateTimeout:      opts.podVacateTimeout,
+		EvictionTimeout:       opts.evictionTimeout,
+		PDBRetryInterval:      opts.pdbRetryInterval,
+		PollInterval:          opts.pollInterval,
+		Force:                 opts.force,
+		ForceDeleteStandalone: opts.forceDeleteStandalone,
+		MaxConcurrency:        opts.maxConcurrency,
+		LogFormat:             opts.logFormat,
+		UncordonOnFailure:     opts.uncordonOnFailure,
+		NodeSelector:          opts.nodeSelector,
+		NodeConcurrency:       opts.nodeConcurrency,
+		Preflight:             opts.preflight,
+		SkipWorkloads:         opts.skipWorkloads,
+		OnlyWorkloads:         opts.onlyWorkloads,
+		Profile:               opts.profile,
+		ConfigFile:            opts.configFile,
+		Mode:                  opts.mode,
+		StatefulNamePatterns:  opts.statefulNamePatterns,
+		EmitEvents:            opts.emitEvents,
+		Resume:                opts.resume,
+		CheckpointPath:        opts.checkpointPath,
+	}
+}
+
+func applyAppOptions(opts *drainOptions, appOpts drainapp.Options) {
+	opts.dryRun = appOpts.DryRun
+	opts.timeout = appOpts.Timeout
+	opts.skipDaemonSets = appOpts.SkipDaemonSets
+	opts.deleteEmptyDir = appOpts.DeleteEmptyDir
+	opts.gracePeriod = appOpts.GracePeriod
+	opts.rolloutTimeout = appOpts.RolloutTimeout
+	opts.podVacateTimeout = appOpts.PodVacateTimeout
+	opts.evictionTimeout = appOpts.EvictionTimeout
+	opts.pdbRetryInterval = appOpts.PDBRetryInterval
+	opts.pollInterval = appOpts.PollInterval
+	opts.force = appOpts.Force
+	opts.forceDeleteStandalone = appOpts.ForceDeleteStandalone
+	opts.maxConcurrency = appOpts.MaxConcurrency
+	opts.logFormat = appOpts.LogFormat
+	opts.uncordonOnFailure = appOpts.UncordonOnFailure
+	opts.nodeSelector = appOpts.NodeSelector
+	opts.nodeConcurrency = appOpts.NodeConcurrency
+	opts.preflight = appOpts.Preflight
+	opts.skipWorkloads = appOpts.SkipWorkloads
+	opts.onlyWorkloads = appOpts.OnlyWorkloads
+	opts.profile = appOpts.Profile
+	opts.configFile = appOpts.ConfigFile
+	opts.mode = appOpts.Mode
+	opts.statefulNamePatterns = appOpts.StatefulNamePatterns
+	opts.emitEvents = appOpts.EmitEvents
+	opts.resume = appOpts.Resume
+	opts.checkpointPath = appOpts.CheckpointPath
+}
+
+func runDrain(cmd *cobra.Command, nodeArgs []string, opts *drainOptions) error {
+	appOpts := toAppOptions(opts)
+	if err := drainapp.Run(cmd.Context(), kubeConfigFlags, os.Stdout, nodeArgs, &appOpts, cmd.Flags().Changed); err != nil {
 		return err
 	}
-
-	// Apply profile defaults for any flags that were not explicitly set by the user.
-	if opts.profile != "" {
-		if err := applyProfile(cmd, opts); err != nil {
-			return err
-		}
-	}
-
-	// --force-delete-standalone implies --force (standalone pods require force).
-	force := opts.force || opts.forceDeleteStandalone
-
-	out := drain.NewPrinterWithFormat(os.Stdout, drain.LogFormat(opts.logFormat))
-
-	drainNode := func(ctx context.Context, nodeName string) error {
-		// Resolve per-node checkpoint path when --resume is set.
-		cpPath := opts.checkpointPath
-		if opts.resume && cpPath == "" {
-			kubeCtx := ""
-			if kubeConfigFlags.Context != nil {
-				kubeCtx = *kubeConfigFlags.Context
-			}
-			var err error
-			cpPath, err = drain.CheckpointPath(kubeCtx, nodeName)
-			if err != nil {
-				return fmt.Errorf("resolving checkpoint path: %w", err)
-			}
-		}
-
-		drainer := drain.NewDrainer(drain.Options{
-			Client:                client,
-			NodeName:              nodeName,
-			DryRun:                opts.dryRun,
-			Timeout:               opts.timeout,
-			SkipDaemonSets:        opts.skipDaemonSets,
-			DeleteEmptyDir:        opts.deleteEmptyDir,
-			GracePeriod:           opts.gracePeriod,
-			RolloutTimeout:        opts.rolloutTimeout,
-			PodVacateTimeout:      opts.podVacateTimeout,
-			EvictionTimeout:       opts.evictionTimeout,
-			PDBRetryInterval:      opts.pdbRetryInterval,
-			PollInterval:          opts.pollInterval,
-			Force:                 force,
-			ForceDeleteStandalone: opts.forceDeleteStandalone,
-			MaxConcurrency:        opts.maxConcurrency,
-			Out:                   out,
-			UncordonOnFailure:     opts.uncordonOnFailure,
-			Preflight:             drain.PreflightMode(opts.preflight),
-			SkipWorkloads:         sliceToSet(opts.skipWorkloads),
-			OnlyWorkloads:         sliceToSet(opts.onlyWorkloads),
-			EmitEvents:            opts.emitEvents,
-			Resume:                opts.resume,
-			CheckpointPath:        cpPath,
-		})
-		return drainer.Run(ctx)
-	}
-
-	concurrency := opts.nodeConcurrency
-	if concurrency <= 0 {
-		concurrency = len(nodes)
-	}
-
-	// Sequential fast-path.
-	if concurrency == 1 {
-		for _, node := range nodes {
-			if err := drainNode(ctx, node); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	// Parallel / batch path — process nodes in batches of `concurrency`.
-	for batchStart := 0; batchStart < len(nodes); batchStart += concurrency {
-		end := batchStart + concurrency
-		if end > len(nodes) {
-			end = len(nodes)
-		}
-		batch := nodes[batchStart:end]
-
-		g, gctx := errgroup.WithContext(ctx)
-		for _, nodeName := range batch {
-			nodeName := nodeName // capture loop variable
-			g.Go(func() error {
-				return drainNode(gctx, nodeName)
-			})
-		}
-		if err := g.Wait(); err != nil {
-			return err
-		}
-	}
+	applyAppOptions(opts, appOpts)
 	return nil
 }
 
-// sliceToSet converts a slice of strings into a set (map[string]bool).
+func validateDrainTargets(opts *drainOptions, nodes []string) error {
+	return drainapp.ValidateTargets(toAppOptions(opts), nodes)
+}
+
+func validateDrainOptions(opts *drainOptions) error {
+	return drainapp.ValidateOptions(toAppOptions(opts))
+}
+
 func sliceToSet(ss []string) map[string]bool {
 	if len(ss) == 0 {
 		return nil
@@ -263,129 +244,11 @@ func sliceToSet(ss []string) map[string]bool {
 	return m
 }
 
-// resolveNodeNames returns the list of node names to drain. When nodeSelector
-// is non-empty, it lists nodes matching that label selector; otherwise it
-// returns nodeArgs directly. Transient API errors are retried up to 3 times.
-func resolveNodeNames(ctx context.Context, client *k8s.Client, nodeArgs []string, nodeSelector string) ([]string, error) {
-	if nodeSelector == "" {
-		return nodeArgs, nil
-	}
-
-	const maxAttempts = 3
-	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		nodeList, err := client.Kubernetes.CoreV1().Nodes().List(ctx, metav1.ListOptions{
-			LabelSelector: nodeSelector,
-		})
-		if err != nil {
-			if isTransientCmdError(err) {
-				select {
-				case <-ctx.Done():
-					return nil, fmt.Errorf("listing nodes with selector %q: %w", nodeSelector, err)
-				case <-time.After(2 * time.Second):
-				}
-				lastErr = err
-				continue
-			}
-			return nil, fmt.Errorf("listing nodes with selector %q: %w", nodeSelector, err)
-		}
-		if len(nodeList.Items) == 0 {
-			return nil, fmt.Errorf("no nodes matched selector %q", nodeSelector)
-		}
-		names := make([]string, len(nodeList.Items))
-		for i, n := range nodeList.Items {
-			names[i] = n.Name
-		}
-		return names, nil
-	}
-	return nil, fmt.Errorf("listing nodes with selector %q: %w", nodeSelector, lastErr)
-}
-
-// isTransientCmdError mirrors drain.isTransientAPIError for use in the cmd package.
-func isTransientCmdError(err error) bool {
-	return k8serrors.IsInternalError(err) ||
-		k8serrors.IsServerTimeout(err) ||
-		k8serrors.IsTimeout(err) ||
-		k8serrors.IsTooManyRequests(err)
-}
-
-// applyProfile loads the named profile from the config file and applies its
-// values to opts for any flag that was not explicitly set on the command line.
-// CLI flags always take precedence over profile values.
-func applyProfile(cmd *cobra.Command, opts *drainOptions) error {
-	cfgPath := opts.configFile
-	if cfgPath == "" {
-		cfgPath = os.Getenv("KUBECTL_SAFED_CONFIG")
-	}
-	if cfgPath == "" {
-		var err error
-		cfgPath, err = config.DefaultConfigPath()
-		if err != nil {
-			return err
-		}
-	}
-
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		return err
-	}
-	prof, err := cfg.GetProfile(opts.profile)
-	if err != nil {
-		return err
-	}
-
-	changed := func(name string) bool { return cmd.Flags().Changed(name) }
-
-	if prof.Timeout != nil && !changed("timeout") {
-		opts.timeout = prof.Timeout.D
-	}
-	if prof.RolloutTimeout != nil && !changed("rollout-timeout") {
-		opts.rolloutTimeout = prof.RolloutTimeout.D
-	}
-	if prof.PodVacateTimeout != nil && !changed("pod-vacate-timeout") {
-		opts.podVacateTimeout = prof.PodVacateTimeout.D
-	}
-	if prof.EvictionTimeout != nil && !changed("eviction-timeout") {
-		opts.evictionTimeout = prof.EvictionTimeout.D
-	}
-	if prof.PDBRetryInterval != nil && !changed("pdb-retry-interval") {
-		opts.pdbRetryInterval = prof.PDBRetryInterval.D
-	}
-	if prof.PollInterval != nil && !changed("poll-interval") {
-		opts.pollInterval = prof.PollInterval.D
-	}
-	if prof.MaxConcurrency != nil && !changed("max-concurrency") {
-		opts.maxConcurrency = *prof.MaxConcurrency
-	}
-	if prof.NodeConcurrency != nil && !changed("node-concurrency") {
-		opts.nodeConcurrency = *prof.NodeConcurrency
-	}
-	if prof.Preflight != "" && !changed("preflight") {
-		opts.preflight = prof.Preflight
-	}
-	if prof.LogFormat != "" && !changed("log-format") {
-		opts.logFormat = prof.LogFormat
-	}
-	if prof.DryRun != nil && !changed("dry-run") {
-		opts.dryRun = *prof.DryRun
-	}
-	if prof.Force != nil && !changed("force") {
-		opts.force = *prof.Force
-	}
-	if prof.IgnoreDaemonSets != nil && !changed("ignore-daemonsets") {
-		opts.skipDaemonSets = *prof.IgnoreDaemonSets
-	}
-	if prof.DeleteEmptyDir != nil && !changed("delete-emptydir-data") {
-		opts.deleteEmptyDir = *prof.DeleteEmptyDir
-	}
-	if prof.ForceDeleteStandalone != nil && !changed("force-delete-standalone") {
-		opts.forceDeleteStandalone = *prof.ForceDeleteStandalone
-	}
-	if prof.UncordonOnFailure != nil && !changed("uncordon-on-failure") {
-		opts.uncordonOnFailure = *prof.UncordonOnFailure
-	}
-	if prof.EmitEvents != nil && !changed("emit-events") {
-		opts.emitEvents = *prof.EmitEvents
-	}
-	return nil
+// applyConfig applies defaults in this order:
+// built-in flag defaults -> config defaults -> built-in mode -> named profile -> CLI flags.
+func applyConfig(cmd *cobra.Command, opts *drainOptions) error {
+	appOpts := toAppOptions(opts)
+	err := drainapp.ApplyConfig(&appOpts, cmd.Flags().Changed)
+	applyAppOptions(opts, appOpts)
+	return err
 }

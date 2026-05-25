@@ -1,0 +1,26 @@
+defaults:
+  preflight: strict
+  uncordon-on-failure: true
+  stateful-name-patterns:
+    - ledger
+    - temporal
+
+profiles:
+  prod:
+    timeout: 45m
+    emit-events: true
+
+  staging:
+    preflight: warn
+    rollout-timeout: 5m
+    max-concurrency: 3
+
+  spot-scale-down:
+    node-concurrency: 5
+    max-concurrency: 2
+    delete-emptydir-data: true
+
+  audit-json:
+    timeout: 45m
+    log-format: json
+    emit-events: true

@@ -1,0 +1,23 @@
+replicas: 3
+annotations:
+  kubectl.safed.io/drain-priority: "100"
+image:
+  registry: mirror.gcr.io
+  repository: grafana/grafana
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: grafana
+        app.kubernetes.io/instance: grafana
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+persistence:
+  enabled: false
+adminPassword: safed-e2e

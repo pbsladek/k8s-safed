@@ -4,7 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -257,5 +259,177 @@ func TestRunWorkloads_Resume_SkipsCompletedWorkloads(t *testing.T) {
 	// runWorkloads should return nil (all skipped) without making any API calls.
 	if err := d.runWorkloads(t.Context(), wls); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestRunWorkloads_WritesCheckpointWithoutResume(t *testing.T) {
+	dir := t.TempDir()
+	cpPath := filepath.Join(dir, "checkpoint.json")
+
+	dep := readyDeploymentForCheckpoint("default", "api")
+	fakeCS := fake.NewClientset(&dep)
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.CheckpointPath = cpPath
+		o.CheckpointContext = "prod"
+	})
+
+	wls := []workload.Workload{
+		{
+			Kind:      workload.KindDeployment,
+			Namespace: "default",
+			Name:      "api",
+			Selector:  dep.Spec.Selector,
+		},
+	}
+	if err := d.runWorkloads(t.Context(), wls); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cp, err := LoadCheckpoint(cpPath)
+	if err != nil {
+		t.Fatalf("LoadCheckpoint failed: %v", err)
+	}
+	if cp.NodeName != "node1" {
+		t.Errorf("NodeName = %q, want node1", cp.NodeName)
+	}
+	if cp.Context != "prod" {
+		t.Errorf("Context = %q, want prod", cp.Context)
+	}
+	if !cp.Completed["Deployment/default/api"] {
+		t.Error("expected completed checkpoint entry for Deployment/default/api")
+	}
+}
+
+func TestRunWorkloads_DryRunDoesNotWriteCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	cpPath := filepath.Join(dir, "checkpoint.json")
+
+	fakeCS := fake.NewClientset()
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.DryRun = true
+		o.CheckpointPath = cpPath
+	})
+
+	wls := []workload.Workload{
+		testWorkload(workload.KindDeployment, "default", "api"),
+	}
+	if err := d.runWorkloads(t.Context(), wls); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := os.Stat(cpPath); !os.IsNotExist(err) {
+		t.Fatalf("dry-run should not write checkpoint, stat err: %v", err)
+	}
+}
+
+func TestRunWorkloads_BatchSavesCompletedWorkloadBeforeSiblingFailure(t *testing.T) {
+	dir := t.TempDir()
+	cpPath := filepath.Join(dir, "checkpoint.json")
+
+	ready := readyDeploymentForCheckpoint("default", "api")
+	stalled := stalledDeploymentForCheckpoint("default", "stalled")
+	fakeCS := fake.NewClientset(&ready, &stalled)
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.CheckpointPath = cpPath
+		o.CheckpointContext = "prod"
+		o.MaxConcurrency = 2
+		o.RolloutTimeout = 30 * time.Millisecond
+		o.PollInterval = time.Millisecond
+	})
+
+	wls := []workload.Workload{
+		{
+			Kind:      workload.KindDeployment,
+			Namespace: "default",
+			Name:      "api",
+			Selector:  ready.Spec.Selector,
+		},
+		{
+			Kind:      workload.KindDeployment,
+			Namespace: "default",
+			Name:      "stalled",
+			Selector:  stalled.Spec.Selector,
+		},
+	}
+	if err := d.runWorkloads(t.Context(), wls); err == nil {
+		t.Fatal("expected stalled workload to fail")
+	}
+
+	cp, err := LoadCheckpoint(cpPath)
+	if err != nil {
+		t.Fatalf("LoadCheckpoint failed: %v", err)
+	}
+	if !cp.Completed["Deployment/default/api"] {
+		t.Error("completed sibling was not saved before batch failure")
+	}
+	if cp.Completed["Deployment/default/stalled"] {
+		t.Error("failed workload should not be marked complete")
+	}
+}
+
+func TestRunWorkloads_ResumeRejectsCheckpointForDifferentNode(t *testing.T) {
+	dir := t.TempDir()
+	cpPath := filepath.Join(dir, "checkpoint.json")
+
+	cp := &Checkpoint{
+		NodeName:  "other-node",
+		Context:   "prod",
+		Completed: map[string]bool{},
+	}
+	if err := cp.Save(cpPath); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeCS := fake.NewClientset()
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.Resume = true
+		o.CheckpointPath = cpPath
+		o.CheckpointContext = "prod"
+	})
+
+	wls := []workload.Workload{
+		testWorkload(workload.KindDeployment, "default", "api"),
+	}
+	if err := d.runWorkloads(t.Context(), wls); err == nil {
+		t.Fatal("expected checkpoint node mismatch error")
+	}
+}
+
+func readyDeploymentForCheckpoint(ns, name string) appsv1.Deployment {
+	replicas := int32(1)
+	return appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  ns,
+			Name:       name,
+			Generation: 1,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
+		},
+		Status: appsv1.DeploymentStatus{
+			ObservedGeneration:  1,
+			UpdatedReplicas:     1,
+			ReadyReplicas:       1,
+			AvailableReplicas:   1,
+			UnavailableReplicas: 0,
+		},
+	}
+}
+
+func stalledDeploymentForCheckpoint(ns, name string) appsv1.Deployment {
+	replicas := int32(1)
+	return appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  ns,
+			Name:       name,
+			Generation: 1,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
+		},
+		Status: appsv1.DeploymentStatus{
+			ObservedGeneration: 1,
+		},
 	}
 }

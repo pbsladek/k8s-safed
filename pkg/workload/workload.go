@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -33,29 +34,33 @@ const DefaultDrainPriority = 100
 // Selector is populated by FindForNode so callers can verify pods have left
 // the node without a second API call.
 type Workload struct {
-	Kind      Kind
-	Namespace string
-	Name      string
-	Selector  *metav1.LabelSelector
+	Kind       Kind
+	Namespace  string
+	Name       string
+	UID        types.UID
+	Generation int64
+	Selector   *metav1.LabelSelector
 	// Priority controls drain order. Lower values are restarted first.
 	// Populated from the kubectl.safed.io/drain-priority annotation;
 	// defaults to DefaultDrainPriority (100) when the annotation is absent.
-	Priority int
+	Priority                  int
+	PriorityAnnotationValue   string
+	PriorityAnnotationInvalid bool
 }
 
 // parseDrainPriority reads the drain-priority annotation and returns its
 // integer value, or DefaultDrainPriority if the annotation is absent or
 // cannot be parsed.
-func parseDrainPriority(annotations map[string]string) int {
+func parseDrainPriority(annotations map[string]string) (int, string, bool) {
 	v, ok := annotations[DrainPriorityAnnotation]
 	if !ok {
-		return DefaultDrainPriority
+		return DefaultDrainPriority, "", false
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return DefaultDrainPriority
+		return DefaultDrainPriority, v, true
 	}
-	return n
+	return n, v, false
 }
 
 func (w Workload) String() string {
@@ -100,6 +105,11 @@ func NewFinder(client kubernetes.Interface) *Finder {
 // DaemonSet, Job, and standalone pods are excluded; they are handled by the
 // conventional eviction path.
 func (f *Finder) FindForNode(ctx context.Context, nodeName string) ([]Workload, error) {
+	// Caches are request-scoped. Workloads and owner chains can change during a
+	// long-running process, so each discovery pass starts fresh.
+	f.rsCache = make(map[string]*appsv1.ReplicaSet)
+	f.wlCache = make(map[string]Workload)
+
 	// List all pods on the node without a phase filter so we see terminal pods
 	// explicitly and can skip them rather than accidentally triggering restarts.
 	pods, err := f.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{
@@ -144,45 +154,65 @@ func (f *Finder) FindForNode(ctx context.Context, nodeName string) ([]Workload, 
 // (_, false, nil) when the pod belongs to a non-rollable owner type,
 // and (_, false, err) on API errors.
 func (f *Finder) resolveOwner(ctx context.Context, pod *corev1.Pod) (Workload, bool, error) {
-	for _, ref := range pod.OwnerReferences {
+	ref, ok := controllerOwnerRef(pod.OwnerReferences)
+	if !ok {
+		return Workload{}, false, nil
+	}
+	switch ref.Kind {
+	case "ReplicaSet":
+		return f.resolveReplicaSet(ctx, pod.Namespace, ref)
+	case "StatefulSet":
+		return f.resolveStatefulSet(ctx, pod.Namespace, ref)
+	case "DaemonSet", "Job", "CronJob":
+		// Not managed via rolling restarts; evictRemaining handles these.
+		return Workload{}, false, nil
+	default:
+		return Workload{}, false, nil
+	}
+}
+
+func controllerOwnerRef(refs []metav1.OwnerReference) (metav1.OwnerReference, bool) {
+	for _, ref := range refs {
+		if ref.Controller != nil && !*ref.Controller {
+			continue
+		}
+		if ref.Controller == nil {
+			continue
+		}
 		switch ref.Kind {
-		case "ReplicaSet":
-			return f.resolveReplicaSet(ctx, pod.Namespace, ref.Name)
-		case "StatefulSet":
-			return f.resolveStatefulSet(ctx, pod.Namespace, ref.Name)
-		case "DaemonSet", "Job", "CronJob":
-			// Not managed via rolling restarts; evictRemaining handles these.
-			return Workload{}, false, nil
+		case "ReplicaSet", "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob":
+			return ref, true
 		}
 	}
-	// Standalone pod — no managed owner.
-	return Workload{}, false, nil
+	return metav1.OwnerReference{}, false
 }
 
 // resolveReplicaSet fetches the ReplicaSet (cached), then walks its owner
 // references to find a Deployment. Returns (_, false, nil) if the ReplicaSet
 // has no Deployment owner (standalone RS).
-func (f *Finder) resolveReplicaSet(ctx context.Context, namespace, rsName string) (Workload, bool, error) {
-	rsKey := namespace + "/" + rsName
+func (f *Finder) resolveReplicaSet(ctx context.Context, namespace string, ref metav1.OwnerReference) (Workload, bool, error) {
+	rsKey := namespace + "/" + ref.Name
 	rs, ok := f.rsCache[rsKey]
 	if !ok {
 		var err error
-		rs, err = f.client.AppsV1().ReplicaSets(namespace).Get(ctx, rsName, metav1.GetOptions{})
+		rs, err = f.client.AppsV1().ReplicaSets(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 		if k8serrors.IsNotFound(err) {
 			// RS was deleted between the pod LIST and this GET (terminating pod
 			// from a previous rollout). Treat as orphaned — skip.
 			return Workload{}, false, nil
 		}
 		if err != nil {
-			return Workload{}, false, fmt.Errorf("getting ReplicaSet %s/%s: %w", namespace, rsName, err)
+			return Workload{}, false, fmt.Errorf("getting ReplicaSet %s/%s: %w", namespace, ref.Name, err)
 		}
 		f.rsCache[rsKey] = rs
 	}
+	if ref.UID != "" && rs.UID != ref.UID {
+		return Workload{}, false, nil
+	}
 
-	for _, ref := range rs.OwnerReferences {
-		if ref.Kind == "Deployment" {
-			return f.resolveDeployment(ctx, namespace, ref.Name)
-		}
+	depRef, ok := controllerOwnerRef(rs.OwnerReferences)
+	if ok && depRef.Kind == "Deployment" {
+		return f.resolveDeployment(ctx, namespace, depRef)
 	}
 	// Standalone ReplicaSet (no Deployment owner) — skip.
 	return Workload{}, false, nil
@@ -191,7 +221,8 @@ func (f *Finder) resolveReplicaSet(ctx context.Context, namespace, rsName string
 // resolveDeployment fetches the Deployment and returns a Workload with its pod
 // selector. Results are cached so multiple RS owners of the same Deployment
 // only incur one API call.
-func (f *Finder) resolveDeployment(ctx context.Context, namespace, name string) (Workload, bool, error) {
+func (f *Finder) resolveDeployment(ctx context.Context, namespace string, ref metav1.OwnerReference) (Workload, bool, error) {
+	name := ref.Name
 	wlKey := fmt.Sprintf("Deployment/%s/%s", namespace, name)
 	if w, ok := f.wlCache[wlKey]; ok {
 		return w, true, nil
@@ -204,13 +235,21 @@ func (f *Finder) resolveDeployment(ctx context.Context, namespace, name string) 
 	if err != nil {
 		return Workload{}, false, fmt.Errorf("getting Deployment %s/%s: %w", namespace, name, err)
 	}
+	if ref.UID != "" && dep.UID != ref.UID {
+		return Workload{}, false, nil
+	}
 
+	priority, priorityValue, priorityInvalid := parseDrainPriority(dep.Annotations)
 	w := Workload{
-		Kind:      KindDeployment,
-		Namespace: namespace,
-		Name:      name,
-		Selector:  dep.Spec.Selector,
-		Priority:  parseDrainPriority(dep.Annotations),
+		Kind:                      KindDeployment,
+		Namespace:                 namespace,
+		Name:                      name,
+		UID:                       dep.UID,
+		Generation:                dep.Generation,
+		Selector:                  dep.Spec.Selector,
+		Priority:                  priority,
+		PriorityAnnotationValue:   priorityValue,
+		PriorityAnnotationInvalid: priorityInvalid,
 	}
 	f.wlCache[wlKey] = w
 	return w, true, nil
@@ -218,7 +257,8 @@ func (f *Finder) resolveDeployment(ctx context.Context, namespace, name string) 
 
 // resolveStatefulSet fetches the StatefulSet and returns a Workload with its
 // pod selector. Results are cached.
-func (f *Finder) resolveStatefulSet(ctx context.Context, namespace, name string) (Workload, bool, error) {
+func (f *Finder) resolveStatefulSet(ctx context.Context, namespace string, ref metav1.OwnerReference) (Workload, bool, error) {
+	name := ref.Name
 	wlKey := fmt.Sprintf("StatefulSet/%s/%s", namespace, name)
 	if w, ok := f.wlCache[wlKey]; ok {
 		return w, true, nil
@@ -231,13 +271,21 @@ func (f *Finder) resolveStatefulSet(ctx context.Context, namespace, name string)
 	if err != nil {
 		return Workload{}, false, fmt.Errorf("getting StatefulSet %s/%s: %w", namespace, name, err)
 	}
+	if ref.UID != "" && sts.UID != ref.UID {
+		return Workload{}, false, nil
+	}
 
+	priority, priorityValue, priorityInvalid := parseDrainPriority(sts.Annotations)
 	w := Workload{
-		Kind:      KindStatefulSet,
-		Namespace: namespace,
-		Name:      name,
-		Selector:  sts.Spec.Selector,
-		Priority:  parseDrainPriority(sts.Annotations),
+		Kind:                      KindStatefulSet,
+		Namespace:                 namespace,
+		Name:                      name,
+		UID:                       sts.UID,
+		Generation:                sts.Generation,
+		Selector:                  sts.Spec.Selector,
+		Priority:                  priority,
+		PriorityAnnotationValue:   priorityValue,
+		PriorityAnnotationInvalid: priorityInvalid,
 	}
 	f.wlCache[wlKey] = w
 	return w, true, nil

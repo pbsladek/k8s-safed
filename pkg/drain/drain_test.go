@@ -1,15 +1,22 @@
 package drain
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/pbsladek/k8s-safed/pkg/k8s"
 	"github.com/pbsladek/k8s-safed/pkg/workload"
@@ -42,7 +49,6 @@ func ownerRef(kind, name string) metav1.OwnerReference {
 	return metav1.OwnerReference{Kind: kind, Name: name}
 }
 
-
 func readyNode(name string) corev1.Node {
 	return corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
@@ -52,6 +58,38 @@ func readyNode(name string) corev1.Node {
 			},
 		},
 	}
+}
+
+func readyDeployment(namespace, name string) appsv1.Deployment {
+	replicas := int32(1)
+	return appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  namespace,
+			Name:       name,
+			Generation: 1,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
+		},
+		Status: appsv1.DeploymentStatus{
+			ObservedGeneration:  1,
+			UpdatedReplicas:     1,
+			ReadyReplicas:       1,
+			AvailableReplicas:   1,
+			UnavailableReplicas: 0,
+		},
+	}
+}
+
+func countPatchActions(client *fake.Clientset, resource string) int {
+	count := 0
+	for _, action := range client.Actions() {
+		if action.GetVerb() == "patch" && action.GetResource().Resource == resource {
+			count++
+		}
+	}
+	return count
 }
 
 // --------------------------------------------------------------------------
@@ -242,6 +280,282 @@ func TestFilterEvictable(t *testing.T) {
 	}
 }
 
+func TestBlockedEvictionPods(t *testing.T) {
+	standalonePod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "standalone", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	jobPod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "job-pod",
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{ownerRef("Job", "batch")},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	emptyDirPod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "emptydir",
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{ownerRef("ReplicaSet", "rs1")},
+		},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name:         "tmp",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	tests := []struct {
+		name           string
+		pods           []corev1.Pod
+		force          bool
+		deleteEmptyDir bool
+		wantCount      int
+		wantReason     string
+	}{
+		{
+			name:       "standalone pod requires force",
+			pods:       []corev1.Pod{standalonePod},
+			wantCount:  1,
+			wantReason: "standalone pods require --force",
+		},
+		{
+			name:       "Job pod requires force",
+			pods:       []corev1.Pod{jobPod},
+			wantCount:  1,
+			wantReason: "Job-owned pods require --force",
+		},
+		{
+			name:       "emptyDir pod requires explicit data deletion",
+			pods:       []corev1.Pod{emptyDirPod},
+			wantCount:  1,
+			wantReason: "emptyDir pods require --delete-emptydir-data or --force",
+		},
+		{
+			name:      "force allows unmanaged pods",
+			pods:      []corev1.Pod{standalonePod, jobPod, emptyDirPod},
+			force:     true,
+			wantCount: 0,
+		},
+		{
+			name:           "delete-emptydir-data allows ReplicaSet emptyDir pod",
+			pods:           []corev1.Pod{emptyDirPod},
+			deleteEmptyDir: true,
+			wantCount:      0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := blockedEvictionPods(tc.pods, true, tc.force, tc.deleteEmptyDir)
+			if len(got) != tc.wantCount {
+				t.Fatalf("got %d blocked pods, want %d", len(got), tc.wantCount)
+			}
+			if tc.wantReason != "" && got[0].reason != tc.wantReason {
+				t.Fatalf("reason = %q, want %q", got[0].reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestEvictRemaining_DryRunWarnsButDoesNotFailOnBlockedPods(t *testing.T) {
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "standalone",
+			Namespace: "default",
+		},
+		Spec:   corev1.PodSpec{NodeName: "node1"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	fakeCS := fake.NewClientset(&pod)
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.DryRun = true
+	})
+
+	if err := d.evictRemaining(t.Context(), &runState{}); err != nil {
+		t.Fatalf("dry-run should not fail on blocked remaining pods: %v", err)
+	}
+}
+
+func TestEvictRemaining_ProtectedWorkloadPodIsLeftUntouched(t *testing.T) {
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "api-pod",
+			Namespace:       "default",
+			Labels:          map[string]string{"app": "api"},
+			OwnerReferences: []metav1.OwnerReference{ownerRef("ReplicaSet", "api-rs")},
+		},
+		Spec:   corev1.PodSpec{NodeName: "node1"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	fakeCS := fake.NewClientset(&pod)
+	d := newTestDrainer(t, "node1", fakeCS)
+	state := &runState{protectedWorkloads: []workload.Workload{{
+		Kind:      workload.KindDeployment,
+		Namespace: "default",
+		Name:      "api",
+		Selector:  &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
+	}}}
+
+	if err := d.evictRemaining(t.Context(), state); err != nil {
+		t.Fatalf("protected workload pod should not be evicted: %v", err)
+	}
+	for _, action := range fakeCS.Actions() {
+		if action.GetVerb() == "create" && action.GetResource().Resource == "pods" && action.GetSubresource() == "eviction" {
+			t.Fatalf("protected workload pod was evicted: %#v", action)
+		}
+	}
+}
+
+func TestWaitForPodsOffNode_WaitsForTerminatingPods(t *testing.T) {
+	now := metav1.Now()
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "api-pod",
+			Namespace:         "default",
+			Labels:            map[string]string{"app": "api"},
+			DeletionTimestamp: &now,
+		},
+		Spec:   corev1.PodSpec{NodeName: "node1"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	fakeCS := fake.NewClientset(&pod)
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.PodVacateTimeout = 20 * time.Millisecond
+	})
+
+	err := d.waitForPodsOffNode(t.Context(), workload.Workload{
+		Kind:      workload.KindDeployment,
+		Namespace: "default",
+		Name:      "api",
+		Selector:  &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
+	})
+	if err == nil {
+		t.Fatal("expected terminating pod to keep the node occupied until timeout")
+	}
+}
+
+func TestEvictWithPDBRetry_RetriesTooManyRequestsThenSucceeds(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "default"}}
+	fakeCS := fake.NewClientset()
+	attempts := 0
+	fakeCS.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "eviction" {
+			return false, nil, nil
+		}
+		attempts++
+		if attempts < 3 {
+			return true, nil, k8serrors.NewTooManyRequests("pdb", 0)
+		}
+		return true, &policyv1.Eviction{}, nil
+	})
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.EvictionTimeout = time.Second
+		o.PDBRetryInterval = time.Millisecond
+	})
+
+	if err := d.evictWithPDBRetry(t.Context(), discardPrinter(), "Pod/default/p1", pod); err != nil {
+		t.Fatalf("eviction retry should succeed: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
+
+func TestEvictWithPDBRetry_ServiceUnavailableThenSucceeds(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "default"}}
+	fakeCS := fake.NewClientset()
+	attempts := 0
+	fakeCS.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "eviction" {
+			return false, nil, nil
+		}
+		attempts++
+		if attempts == 1 {
+			return true, nil, k8serrors.NewServiceUnavailable("quota")
+		}
+		return true, &policyv1.Eviction{}, nil
+	})
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.EvictionTimeout = time.Second
+		o.PDBRetryInterval = time.Millisecond
+	})
+
+	if err := d.evictWithPDBRetry(t.Context(), discardPrinter(), "Pod/default/p1", pod); err != nil {
+		t.Fatalf("eviction retry should succeed: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestEvictWithPDBRetry_NotFoundIsSuccess(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "default"}}
+	fakeCS := fake.NewClientset()
+	fakeCS.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "eviction" {
+			return false, nil, nil
+		}
+		return true, nil, k8serrors.NewNotFound(corev1.Resource("pods"), "p1")
+	})
+	d := newTestDrainer(t, "node1", fakeCS)
+
+	if err := d.evictWithPDBRetry(t.Context(), discardPrinter(), "Pod/default/p1", pod); err != nil {
+		t.Fatalf("not found should be treated as success: %v", err)
+	}
+}
+
+func TestEvictWithPDBRetry_TimeoutIncludesAttempts(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "default"}}
+	fakeCS := fake.NewClientset()
+	fakeCS.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "eviction" {
+			return false, nil, nil
+		}
+		return true, nil, k8serrors.NewTooManyRequests("pdb", 0)
+	})
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.EvictionTimeout = 10 * time.Millisecond
+		o.PDBRetryInterval = time.Millisecond
+	})
+
+	err := d.evictWithPDBRetry(t.Context(), discardPrinter(), "Pod/default/p1", pod)
+	if err == nil {
+		t.Fatal("expected timeout")
+	}
+	if !strings.Contains(err.Error(), "timed out waiting for PDB") || !strings.Contains(err.Error(), "attempt") {
+		t.Fatalf("timeout error missing context: %v", err)
+	}
+}
+
+func TestEvictWithPDBRetry_PropagatesGracePeriod(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "default"}}
+	fakeCS := fake.NewClientset()
+	var gotGrace *int64
+	fakeCS.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "eviction" {
+			return false, nil, nil
+		}
+		create := action.(k8stesting.CreateAction)
+		eviction := create.GetObject().(*policyv1.Eviction)
+		gotGrace = eviction.DeleteOptions.GracePeriodSeconds
+		return true, &policyv1.Eviction{}, nil
+	})
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.GracePeriod = 7
+	})
+
+	if err := d.evictWithPDBRetry(t.Context(), discardPrinter(), "Pod/default/p1", pod); err != nil {
+		t.Fatalf("eviction should succeed: %v", err)
+	}
+	if gotGrace == nil || *gotGrace != 7 {
+		t.Fatalf("grace period = %v, want 7", gotGrace)
+	}
+}
+
 // --------------------------------------------------------------------------
 // buildEviction
 // --------------------------------------------------------------------------
@@ -344,6 +658,24 @@ func TestDrainer_Run_DryRun(t *testing.T) {
 	}
 }
 
+func TestDrainer_Run_DryRunDoesNotEmitEvents(t *testing.T) {
+	node := readyNode("node1")
+	fakeCS := fake.NewClientset(&node)
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.DryRun = true
+		o.EmitEvents = true
+	})
+
+	if err := d.Run(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, action := range fakeCS.Actions() {
+		if action.GetResource().Resource == "events" && action.GetVerb() == "create" {
+			t.Fatalf("dry-run emitted an event: %#v", action)
+		}
+	}
+}
+
 func TestDrainer_Run_NoWorkloads(t *testing.T) {
 	// Only a node, no pods — should cordon then exit cleanly.
 	node := readyNode("node1")
@@ -359,40 +691,130 @@ func TestDrainer_Run_NoWorkloads(t *testing.T) {
 	}
 }
 
+func TestDrainer_Run_ResumeCheckpointMismatchDoesNotCordon(t *testing.T) {
+	cpPath := filepath.Join(t.TempDir(), "checkpoint.json")
+	cp := &Checkpoint{
+		NodeName:  "other-node",
+		Context:   "prod",
+		Completed: map[string]bool{},
+	}
+	if err := cp.Save(cpPath); err != nil {
+		t.Fatal(err)
+	}
+
+	node := readyNode("node1")
+	fakeCS := fake.NewClientset(&node)
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.Resume = true
+		o.CheckpointPath = cpPath
+		o.CheckpointContext = "prod"
+	})
+
+	if err := d.Run(context.Background()); err == nil {
+		t.Fatal("expected checkpoint mismatch error")
+	}
+	n, _ := fakeCS.CoreV1().Nodes().Get(context.Background(), "node1", metav1.GetOptions{})
+	if n.Spec.Unschedulable {
+		t.Error("checkpoint input errors must not cordon the node")
+	}
+}
+
+func TestCheckpointCanSkip_MetadataMismatchRestarts(t *testing.T) {
+	fakeCS := fake.NewClientset()
+	d := newTestDrainer(t, "node1", fakeCS)
+	w := makeWorkload(workload.KindDeployment, "default", "api")
+	w.UID = "new-uid"
+	w.Generation = 2
+	cp := newCheckpoint()
+	cp.Completed["Deployment/default/api"] = true
+	cp.Workloads["Deployment/default/api"] = CheckpointWork{
+		Kind:       "Deployment",
+		Namespace:  "default",
+		Name:       "api",
+		UID:        "old-uid",
+		Generation: 1,
+	}
+
+	skip, err := d.checkpointCanSkip(context.Background(), cp, w)
+	if err != nil {
+		t.Fatalf("checkpointCanSkip: %v", err)
+	}
+	if skip {
+		t.Fatal("metadata mismatch should not skip workload")
+	}
+}
+
+func TestCheckpointCanSkip_LegacyEntryWithPodsRestarts(t *testing.T) {
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "api-pod",
+			Namespace: "default",
+			Labels:    map[string]string{"app": "api"},
+		},
+		Spec:   corev1.PodSpec{NodeName: "node1"},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	fakeCS := fake.NewClientset(&pod)
+	d := newTestDrainer(t, "node1", fakeCS)
+	w := workload.Workload{
+		Kind:      workload.KindDeployment,
+		Namespace: "default",
+		Name:      "api",
+		Selector:  &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
+	}
+	cp := newCheckpoint()
+	cp.Completed["Deployment/default/api"] = true
+
+	skip, err := d.checkpointCanSkip(context.Background(), cp, w)
+	if err != nil {
+		t.Fatalf("checkpointCanSkip: %v", err)
+	}
+	if skip {
+		t.Fatal("legacy checkpoint with pods still on node should not skip workload")
+	}
+}
+
 // --------------------------------------------------------------------------
 // runWorkloads — concurrency modes
 // --------------------------------------------------------------------------
 
-func TestDrainer_Run_MaxConcurrency_Parallel(t *testing.T) {
-	// Two nodes' worth of workloads run with MaxConcurrency=0 (all at once).
-	// With a fake client and no pods the full run should complete without error
-	// and the node should be cordoned.
-	node := readyNode("node1")
-	fakeCS := fake.NewClientset(&node)
+func TestDrainer_RunWorkloads_MaxConcurrency_Parallel(t *testing.T) {
+	api := readyDeployment("default", "api")
+	worker := readyDeployment("default", "worker")
+	fakeCS := fake.NewClientset(&api, &worker)
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
 		o.MaxConcurrency = 0 // unlimited
 	})
 
-	if err := d.Run(context.Background()); err != nil {
+	if err := d.runWorkloads(context.Background(), []workload.Workload{
+		makeWorkload(workload.KindDeployment, "default", "api"),
+		makeWorkload(workload.KindDeployment, "default", "worker"),
+	}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	n, _ := fakeCS.CoreV1().Nodes().Get(context.Background(), "node1", metav1.GetOptions{})
-	if !n.Spec.Unschedulable {
-		t.Error("node should be cordoned")
+	if got := countPatchActions(fakeCS, "deployments"); got != 2 {
+		t.Fatalf("patched deployments = %d, want 2", got)
 	}
 }
 
-func TestDrainer_Run_MaxConcurrency_Batch(t *testing.T) {
-	// MaxConcurrency=2 with no workloads — exercises the batch path without
-	// needing real rollout infrastructure.
-	node := readyNode("node1")
-	fakeCS := fake.NewClientset(&node)
+func TestDrainer_RunWorkloads_MaxConcurrency_Batch(t *testing.T) {
+	api := readyDeployment("default", "api")
+	worker := readyDeployment("default", "worker")
+	db := readyDeployment("default", "db")
+	fakeCS := fake.NewClientset(&api, &worker, &db)
 	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
 		o.MaxConcurrency = 2
 	})
 
-	if err := d.Run(context.Background()); err != nil {
+	if err := d.runWorkloads(context.Background(), []workload.Workload{
+		makeWorkload(workload.KindDeployment, "default", "api"),
+		makeWorkload(workload.KindDeployment, "default", "worker"),
+		makeWorkload(workload.KindDeployment, "default", "db"),
+	}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := countPatchActions(fakeCS, "deployments"); got != 3 {
+		t.Fatalf("patched deployments = %d, want 3", got)
 	}
 }
 
@@ -467,6 +889,89 @@ func TestWaitForDeploymentRollout_ProgressDeadlineExceeded(t *testing.T) {
 	}
 }
 
+func TestNewReplicaSetSelector_UsesCurrentRevisionOwnedByUID(t *testing.T) {
+	controller := true
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "default",
+			Name:        "api",
+			UID:         "dep-uid",
+			Annotations: map[string]string{"deployment.kubernetes.io/revision": "2"},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
+		},
+	}
+	oldRS := appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "default",
+			Name:        "api-old",
+			Labels:      map[string]string{"app": "api", "pod-template-hash": "old"},
+			Annotations: map[string]string{"deployment.kubernetes.io/revision": "1"},
+			OwnerReferences: []metav1.OwnerReference{{
+				Kind:       "Deployment",
+				Name:       "api",
+				UID:        "dep-uid",
+				Controller: &controller,
+			}},
+		},
+		Spec: appsv1.ReplicaSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api", "pod-template-hash": "old"}},
+		},
+	}
+	newRS := oldRS
+	newRS.Name = "api-new"
+	newRS.Labels = map[string]string{"app": "api", "pod-template-hash": "new"}
+	newRS.Annotations = map[string]string{"deployment.kubernetes.io/revision": "2"}
+	newRS.Spec.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api", "pod-template-hash": "new"}}
+
+	fakeCS := fake.NewClientset(&oldRS, &newRS)
+	d := newTestDrainer(t, "node1", fakeCS)
+	got, err := d.newReplicaSetSelector(context.Background(), dep)
+	if err != nil {
+		t.Fatalf("newReplicaSetSelector: %v", err)
+	}
+	if got.MatchLabels["pod-template-hash"] != "new" {
+		t.Fatalf("selector = %#v, want new replica set selector", got.MatchLabels)
+	}
+}
+
+func TestFindBadPodState_IgnoresOldRevisionPods(t *testing.T) {
+	oldPod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "api-old",
+			Namespace: "default",
+			Labels:    map[string]string{"app": "api", "pod-template-hash": "old"},
+		},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Name: "api",
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+				Reason: "ImagePullBackOff",
+			}},
+		}}},
+	}
+	newPod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "api-new",
+			Namespace: "default",
+			Labels:    map[string]string{"app": "api", "pod-template-hash": "new"},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	fakeCS := fake.NewClientset(&oldPod, &newPod)
+	d := newTestDrainer(t, "node1", fakeCS)
+
+	reason, pod, err := d.findBadPodState(context.Background(), "default", &metav1.LabelSelector{
+		MatchLabels: map[string]string{"app": "api", "pod-template-hash": "new"},
+	})
+	if err != nil {
+		t.Fatalf("findBadPodState: %v", err)
+	}
+	if reason != "" || pod != nil {
+		t.Fatalf("old revision bad pod should be ignored, got reason=%q pod=%v", reason, pod)
+	}
+}
+
 // --------------------------------------------------------------------------
 // waitForStatefulSetRollout — condition logic
 // --------------------------------------------------------------------------
@@ -534,6 +1039,17 @@ func TestWaitForStatefulSetRollout_EmptyRevisionNotComplete(t *testing.T) {
 	}
 }
 
+func TestNewRevisionSelector_AddsControllerRevisionHash(t *testing.T) {
+	base := &metav1.LabelSelector{MatchLabels: map[string]string{"app": "db"}}
+	got := newRevisionSelector(base, "db-abc")
+	if got.MatchLabels["app"] != "db" || got.MatchLabels["controller-revision-hash"] != "db-abc" {
+		t.Fatalf("selector labels = %#v", got.MatchLabels)
+	}
+	if _, ok := base.MatchLabels["controller-revision-hash"]; ok {
+		t.Fatal("base selector was mutated")
+	}
+}
+
 // --------------------------------------------------------------------------
 // filterWorkloads
 // --------------------------------------------------------------------------
@@ -555,7 +1071,8 @@ func TestFilterWorkloads_NoFilter_ReturnsAll(t *testing.T) {
 		makeWorkload(workload.KindDeployment, "default", "api"),
 		makeWorkload(workload.KindStatefulSet, "default", "db"),
 	}
-	got := d.filterWorkloads(wls)
+	state := &runState{}
+	got := d.filterWorkloads(state, wls)
 	if len(got) != 2 {
 		t.Errorf("expected 2 workloads with no filter, got %d", len(got))
 	}
@@ -571,12 +1088,16 @@ func TestFilterWorkloads_SkipWorkload_Removes(t *testing.T) {
 		makeWorkload(workload.KindDeployment, "default", "api"),
 		makeWorkload(workload.KindStatefulSet, "default", "db"),
 	}
-	got := d.filterWorkloads(wls)
+	state := &runState{}
+	got := d.filterWorkloads(state, wls)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 workload after skip, got %d", len(got))
 	}
 	if got[0].Name != "db" {
 		t.Errorf("expected remaining workload to be 'db', got %q", got[0].Name)
+	}
+	if len(state.protectedWorkloads) != 1 || state.protectedWorkloads[0].Name != "api" {
+		t.Fatalf("protected workloads = %#v, want api", state.protectedWorkloads)
 	}
 }
 
@@ -591,12 +1112,16 @@ func TestFilterWorkloads_OnlyWorkload_KeepsOnlyNamed(t *testing.T) {
 		makeWorkload(workload.KindStatefulSet, "default", "db"),
 		makeWorkload(workload.KindDeployment, "default", "worker"),
 	}
-	got := d.filterWorkloads(wls)
+	state := &runState{}
+	got := d.filterWorkloads(state, wls)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 workload after only filter, got %d", len(got))
 	}
 	if got[0].Name != "db" {
 		t.Errorf("expected 'db', got %q", got[0].Name)
+	}
+	if len(state.protectedWorkloads) != 2 {
+		t.Fatalf("protected workloads = %#v, want api and worker", state.protectedWorkloads)
 	}
 }
 
@@ -613,9 +1138,35 @@ func TestFilterWorkloads_SkipAll_ReturnsEmpty(t *testing.T) {
 		makeWorkload(workload.KindDeployment, "default", "api"),
 		makeWorkload(workload.KindStatefulSet, "default", "db"),
 	}
-	got := d.filterWorkloads(wls)
+	state := &runState{}
+	got := d.filterWorkloads(state, wls)
 	if len(got) != 0 {
 		t.Errorf("expected 0 workloads after skipping all, got %d", len(got))
+	}
+	if len(state.protectedWorkloads) != 2 {
+		t.Fatalf("protected workloads = %#v, want both workloads", state.protectedWorkloads)
+	}
+}
+
+func TestWarnInvalidPriorityAnnotations(t *testing.T) {
+	var buf bytes.Buffer
+	fakeCS := fake.NewClientset()
+	d := newTestDrainer(t, "node1", fakeCS, func(o *Options) {
+		o.Out = NewPrinterTo(&buf)
+	})
+
+	d.warnInvalidPriorityAnnotations([]workload.Workload{{
+		Kind:                      workload.KindDeployment,
+		Namespace:                 "default",
+		Name:                      "api",
+		Priority:                  workload.DefaultDrainPriority,
+		PriorityAnnotationValue:   "bad",
+		PriorityAnnotationInvalid: true,
+	}})
+
+	out := buf.String()
+	if !strings.Contains(out, "invalid kubectl.safed.io/drain-priority=\"bad\"") {
+		t.Fatalf("expected invalid priority warning, got:\n%s", out)
 	}
 }
 

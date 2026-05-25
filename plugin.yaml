@@ -21,7 +21,7 @@ spec:
   caveats: |
     * The plugin requires permissions to cordon nodes, list/update Deployments,
       StatefulSets, ReplicaSets, and evict Pods.
-    * DaemonSet pods are skipped by default (use --skip-daemon-sets=false to evict them).
+    * DaemonSet pods are skipped by default (use --ignore-daemonsets=false to evict them).
   platforms:
   - selector:
       matchLabels:

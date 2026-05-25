@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Name }}
+  namespace: {{ .Namespace }}
+{{ if .IncludePriority }}
+  annotations:
+    kubectl.safed.io/drain-priority: "{{ .Priority }}"
+{{ end }}
+spec:
+  replicas: {{ .Replicas }}
+{{ if .Paused }}
+  paused: true
+{{ end }}
+{{ if gt .MinReadySeconds 0 }}
+  minReadySeconds: {{ .MinReadySeconds }}
+{{ end }}
+{{ if gt .ProgressDeadlineSeconds 0 }}
+  progressDeadlineSeconds: {{ .ProgressDeadlineSeconds }}
+{{ end }}
+{{ if .Recreate }}
+  strategy:
+    type: Recreate
+{{ end }}
+  selector:
+    matchLabels:
+      app: {{ .Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Name }}
+    spec:
+      terminationGracePeriodSeconds: {{ .TerminationGraceSeconds }}
+      containers:
+      - name: {{ .ContainerName }}
+        image: {{ .Image }}
+        command: ["/bin/sh", "-c", {{ printf "%q" .Command }}]
+{{ if .ReadinessCommand }}
+        readinessProbe:
+          exec:
+            command: ["/bin/sh", "-c", {{ printf "%q" .ReadinessCommand }}]
+          periodSeconds: 1
+          failureThreshold: 1
+{{ end }}
+        resources:
+          requests:
+            cpu: 10m
+            memory: {{ .MemoryRequest }}

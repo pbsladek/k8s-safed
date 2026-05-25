@@ -1,5 +1,3 @@
-//go:build e2e
-
 package framework
 
 import (
@@ -9,14 +7,6 @@ import (
 	"os/exec"
 	"strings"
 	"time"
-)
-
-const (
-	// DefaultClusterName is the k3d cluster name used for local e2e runs.
-	// Override with SAFED_E2E_CLUSTER_NAME for CI isolation.
-	DefaultClusterName = "safed-e2e"
-	// E2ENamespace is the namespace where test workloads are deployed.
-	E2ENamespace = "e2e"
 )
 
 // ClusterName returns the cluster name from SAFED_E2E_CLUSTER_NAME if set,
@@ -57,6 +47,13 @@ func (c *Cluster) Create(ctx context.Context) error {
 		// No load-balancer port mapping needed for these tests.
 		"--no-lb",
 	}
+	flannelBackend := DefaultFlannelBackend
+	if backend := os.Getenv("SAFED_E2E_FLANNEL_BACKEND"); backend != "" {
+		flannelBackend = backend
+	}
+	if flannelBackend != "" {
+		args = append(args, "--k3s-arg", "--flannel-backend="+flannelBackend+"@server:*")
+	}
 	// Allow CI to pin a specific k3s image via K3S_IMAGE env var.
 	if img := os.Getenv("K3S_IMAGE"); img != "" {
 		args = append(args, "--image", img)
@@ -73,7 +70,9 @@ func (c *Cluster) Create(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create kubeconfig temp file: %w", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close kubeconfig temp file: %w", err)
+	}
 	c.KubeconfigPath = f.Name()
 
 	writeCmd := exec.CommandContext(ctx, "k3d", "kubeconfig", "write", c.Name,

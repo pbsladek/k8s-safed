@@ -7,7 +7,11 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/pbsladek/k8s-safed/pkg/workload"
 )
@@ -63,12 +67,26 @@ func makePod(ns, name string, owners []metav1.OwnerReference) corev1.Pod {
 }
 
 func ownerRef(kind, name string) metav1.OwnerReference {
-	return metav1.OwnerReference{Kind: kind, Name: name}
+	controller := true
+	return metav1.OwnerReference{
+		Kind:       kind,
+		Name:       name,
+		UID:        testUID(kind, name),
+		Controller: &controller,
+	}
+}
+
+func testUID(kind, name string) types.UID {
+	return types.UID(kind + "-" + name)
+}
+
+func boolPtr(v bool) *bool {
+	return &v
 }
 
 func makeRS(ns, name, depName string) appsv1.ReplicaSet {
 	rs := appsv1.ReplicaSet{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: testUID("ReplicaSet", name)},
 	}
 	if depName != "" {
 		rs.OwnerReferences = []metav1.OwnerReference{ownerRef("Deployment", depName)}
@@ -78,7 +96,7 @@ func makeRS(ns, name, depName string) appsv1.ReplicaSet {
 
 func makeDeployment(ns, name string) appsv1.Deployment {
 	return appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: testUID("Deployment", name)},
 		Spec: appsv1.DeploymentSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"app": name},
@@ -89,7 +107,7 @@ func makeDeployment(ns, name string) appsv1.Deployment {
 
 func makeStatefulSet(ns, name string) appsv1.StatefulSet {
 	return appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, UID: testUID("StatefulSet", name)},
 		Spec: appsv1.StatefulSetSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{"app": name},
@@ -138,6 +156,55 @@ func TestFinder_FindForNode_Deployment(t *testing.T) {
 	}
 	if wls[0].Selector == nil {
 		t.Error("expected Selector to be set")
+	}
+}
+
+func TestFinder_FindForNode_ListsPodsWithNodeFieldSelector(t *testing.T) {
+	client := fake.NewClientset()
+	client.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		listAction := action.(k8stesting.ListAction)
+		got := listAction.GetListRestrictions().Fields.String()
+		if got != fields.OneTermEqualSelector("spec.nodeName", "node1").String() {
+			t.Fatalf("pod list field selector = %q, want spec.nodeName=node1", got)
+		}
+		return true, &corev1.PodList{}, nil
+	})
+	f := workload.NewFinder(client)
+
+	if _, err := f.FindForNode(context.Background(), "node1"); err != nil {
+		t.Fatalf("FindForNode: %v", err)
+	}
+}
+
+func TestFinder_FindForNode_IgnoresNonControllerOwnerReferences(t *testing.T) {
+	tests := []struct {
+		name       string
+		controller *bool
+	}{
+		{name: "nil controller", controller: nil},
+		{name: "false controller", controller: boolPtr(false)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dep := makeDeployment("default", "api")
+			rs := makeRS("default", "api-rs1", "api")
+			pod := makePod("default", "api-pod1", []metav1.OwnerReference{{
+				Kind:       "ReplicaSet",
+				Name:       "api-rs1",
+				UID:        testUID("ReplicaSet", "api-rs1"),
+				Controller: tc.controller,
+			}})
+
+			client := fake.NewClientset(&dep, &rs, &pod)
+			f := workload.NewFinder(client)
+			wls, err := f.FindForNode(context.Background(), "node1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(wls) != 0 {
+				t.Fatalf("expected non-controller owner to be ignored, got %#v", wls)
+			}
+		})
 	}
 }
 
@@ -262,6 +329,57 @@ func TestFinder_FindForNode_StandaloneRS(t *testing.T) {
 	}
 }
 
+func TestFinder_FindForNode_SkipsStaleReplicaSetOwnerUID(t *testing.T) {
+	dep := makeDeployment("default", "api")
+	rs := makeRS("default", "api-rs1", "api")
+	pod := makePod("default", "api-pod1", []metav1.OwnerReference{{
+		Kind:       "ReplicaSet",
+		Name:       "api-rs1",
+		UID:        "stale-rs-uid",
+		Controller: boolPtr(true),
+	}})
+
+	client := fake.NewClientset(&dep, &rs, &pod)
+	f := workload.NewFinder(client)
+
+	wls, err := f.FindForNode(context.Background(), "node1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wls) != 0 {
+		t.Fatalf("expected stale owner UID to be skipped, got %d workload(s)", len(wls))
+	}
+}
+
+func TestFinder_FindForNode_CacheIsRequestScoped(t *testing.T) {
+	dep := makeDeployment("default", "api")
+	rs := makeRS("default", "api-rs1", "api")
+	pod := makePod("default", "api-pod1", []metav1.OwnerReference{ownerRef("ReplicaSet", "api-rs1")})
+
+	client := fake.NewClientset(&dep, &rs, &pod)
+	f := workload.NewFinder(client)
+
+	wls, err := f.FindForNode(context.Background(), "node1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wls) != 1 || wls[0].Priority != workload.DefaultDrainPriority {
+		t.Fatalf("unexpected initial workload: %#v", wls)
+	}
+
+	dep.Annotations = map[string]string{workload.DrainPriorityAnnotation: "7"}
+	if _, err := client.AppsV1().Deployments("default").Update(context.Background(), &dep, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	wls, err = f.FindForNode(context.Background(), "node1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wls) != 1 || wls[0].Priority != 7 {
+		t.Fatalf("expected refreshed priority 7, got %#v", wls)
+	}
+}
+
 func TestFinder_FindForNode_MultipleWorkloads(t *testing.T) {
 	dep := makeDeployment("default", "api")
 	rs := makeRS("default", "api-rs1", "api")
@@ -358,6 +476,12 @@ func TestFinder_FindForNode_Priority_InvalidAnnotation_UsesDefault(t *testing.T)
 	}
 	if wls[0].Priority != workload.DefaultDrainPriority {
 		t.Errorf("invalid annotation should fall back to DefaultDrainPriority, got %d", wls[0].Priority)
+	}
+	if !wls[0].PriorityAnnotationInvalid {
+		t.Error("invalid annotation should be marked invalid")
+	}
+	if wls[0].PriorityAnnotationValue != "not-a-number" {
+		t.Errorf("PriorityAnnotationValue = %q, want not-a-number", wls[0].PriorityAnnotationValue)
 	}
 }
 

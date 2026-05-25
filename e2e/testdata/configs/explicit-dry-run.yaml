@@ -1,0 +1,4 @@
+defaults:
+  preflight: off
+  dry-run: true
+  poll-interval: 1s

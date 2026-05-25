@@ -1,0 +1,4 @@
+profiles:
+  invalid:
+    preflight: maybe
+    rollout-timeout: 5m

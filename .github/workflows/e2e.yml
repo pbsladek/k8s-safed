@@ -25,6 +25,7 @@ env:
   KUBECTL_VERSION: v1.35.3
   HELM_VERSION: v3.16.4
   SAFED_E2E_CLUSTER_NAME: safed-e2e-ci
+  SAFED_E2E_UPLOAD_ARTIFACTS: "false"
 
 jobs:
   e2e:
@@ -74,9 +75,15 @@ jobs:
         run: go mod download
 
       - name: Run E2E tests
-        run: go test -v -tags=e2e -count=1 -timeout=30m ./e2e/...
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            make e2e-pr E2E_TIMEOUT=25m
+          else
+            make e2e-full E2E_TIMEOUT=35m
+          fi
         env:
           SAFED_E2E_CLUSTER_NAME: ${{ env.SAFED_E2E_CLUSTER_NAME }}
+          SAFED_E2E_ARTIFACT_DIR: /tmp/safed-e2e-diagnostics
 
       - name: Collect diagnostics on failure
         if: failure()
@@ -86,7 +93,7 @@ jobs:
           SAFED_E2E_CLUSTER_NAME: ${{ env.SAFED_E2E_CLUSTER_NAME }}
 
       - name: Upload diagnostics
-        if: failure()
+        if: ${{ failure() || env.SAFED_E2E_UPLOAD_ARTIFACTS == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}

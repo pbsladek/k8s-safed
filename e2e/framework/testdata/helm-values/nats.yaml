@@ -1,0 +1,27 @@
+config:
+  cluster:
+    enabled: true
+    replicas: 3
+statefulSet:
+  merge:
+    metadata:
+      annotations:
+        kubectl.safed.io/drain-priority: "10"
+  topologySpreadConstraints:
+    kubernetes.io/hostname:
+      maxSkew: 1
+      whenUnsatisfiable: ScheduleAnyway
+container:
+  image:
+    fullImageName: mirror.gcr.io/library/nats:2.12.6-alpine
+  merge:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
+reloader:
+  enabled: false
+natsBox:
+  enabled: false

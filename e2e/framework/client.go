@@ -1,14 +1,12 @@
-//go:build e2e
-
 package framework
 
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -32,8 +30,26 @@ func EnsureNamespace(ctx context.Context, client kubernetes.Interface, name stri
 	_, err := client.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 	}, metav1.CreateOptions{})
-	if err != nil && !strings.Contains(err.Error(), "already exists") {
+	if err != nil && !k8serrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create namespace %s: %w", name, err)
+	}
+	return nil
+}
+
+// WaitForClusterAddons waits for the built-in k3s addons that prove pod
+// networking and dynamic local storage are usable before test charts install.
+func WaitForClusterAddons(ctx context.Context, client kubernetes.Interface, timeout time.Duration) error {
+	addons := []struct {
+		namespace string
+		name      string
+	}{
+		{namespace: "kube-system", name: "coredns"},
+		{namespace: "kube-system", name: "local-path-provisioner"},
+	}
+	for _, addon := range addons {
+		if err := WaitForDeploymentReady(ctx, client, addon.namespace, addon.name, timeout); err != nil {
+			return fmt.Errorf("cluster addon %s/%s not ready: %w", addon.namespace, addon.name, err)
+		}
 	}
 	return nil
 }
@@ -59,8 +75,13 @@ func NodeHasActivePods(ctx context.Context, client kubernetes.Interface, nodeNam
 // EventsForNode returns Kubernetes Events on the given node (in "default"
 // namespace, where node events are recorded).
 func EventsForNode(ctx context.Context, client kubernetes.Interface, nodeName string) ([]corev1.Event, error) {
-	list, err := client.CoreV1().Events("default").List(ctx, metav1.ListOptions{
-		FieldSelector: fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=Node", nodeName),
+	return EventsForObject(ctx, client, "default", "Node", nodeName)
+}
+
+// EventsForObject returns Kubernetes Events for an object.
+func EventsForObject(ctx context.Context, client kubernetes.Interface, namespace, kind, name string) ([]corev1.Event, error) {
+	list, err := client.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("involvedObject.name=%s,involvedObject.kind=%s", name, kind),
 	})
 	if err != nil {
 		return nil, err
@@ -85,12 +106,21 @@ func WaitForDeploymentReady(ctx context.Context, client kubernetes.Interface, ns
 			desired = *dep.Spec.Replicas
 		}
 		s := dep.Status
-		if s.ReadyReplicas == desired && s.AvailableReplicas == desired && s.UnavailableReplicas == 0 {
+		if s.ObservedGeneration >= dep.Generation &&
+			s.UpdatedReplicas == desired &&
+			s.ReadyReplicas == desired &&
+			s.AvailableReplicas == desired &&
+			s.UnavailableReplicas == 0 {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("deployment %s/%s not ready after %v (ready=%d/%d unavail=%d)",
-				ns, name, timeout, s.ReadyReplicas, desired, s.UnavailableReplicas)
+			return fmt.Errorf("deployment %s/%s not ready after %v (observedGen=%d generation=%d updated=%d/%d ready=%d/%d available=%d/%d unavail=%d)",
+				ns, name, timeout,
+				s.ObservedGeneration, dep.Generation,
+				s.UpdatedReplicas, desired,
+				s.ReadyReplicas, desired,
+				s.AvailableReplicas, desired,
+				s.UnavailableReplicas)
 		}
 		select {
 		case <-ctx.Done():
@@ -112,12 +142,20 @@ func WaitForStatefulSetReady(ctx context.Context, client kubernetes.Interface, n
 		if sts.Spec.Replicas != nil {
 			desired = *sts.Spec.Replicas
 		}
-		if sts.Status.ReadyReplicas == desired {
+		s := sts.Status
+		if s.ObservedGeneration >= sts.Generation &&
+			s.UpdatedReplicas == desired &&
+			s.CurrentReplicas == desired &&
+			s.ReadyReplicas == desired {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("statefulset %s/%s not ready after %v (ready=%d/%d)",
-				ns, name, timeout, sts.Status.ReadyReplicas, desired)
+			return fmt.Errorf("statefulset %s/%s not ready after %v (observedGen=%d generation=%d updated=%d/%d current=%d/%d ready=%d/%d)",
+				ns, name, timeout,
+				s.ObservedGeneration, sts.Generation,
+				s.UpdatedReplicas, desired,
+				s.CurrentReplicas, desired,
+				s.ReadyReplicas, desired)
 		}
 		select {
 		case <-ctx.Done():
@@ -141,6 +179,29 @@ func WaitForNoActivePodsOnNode(ctx context.Context, client kubernetes.Interface,
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out waiting for no active pods on node %s", nodeName)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+}
+
+// WaitForNoActivePodsWithSelectorOnNode polls until a node has no active pods
+// matching labelSelector.
+func WaitForNoActivePodsWithSelectorOnNode(ctx context.Context, client kubernetes.Interface, nodeName, ns, labelSelector string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		has, err := NodeHasActivePodsWithSelector(ctx, client, nodeName, ns, labelSelector)
+		if err != nil {
+			return err
+		}
+		if !has {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for no active pods with %q on node %s", labelSelector, nodeName)
 		}
 		select {
 		case <-ctx.Done():
